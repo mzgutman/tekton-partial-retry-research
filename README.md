@@ -2,8 +2,8 @@
 
 This directory contains research, design proposals, and architectural decisions for implementing partial PipelineRun retry functionality in Tekton Pipelines.
 
-**Jira Epic:** [SRVKP-14121](https://redhat.atlassian.net/browse/SRVKP-14121)  
-**Status:** Active research and evaluation  
+**Jira Epic:** [SRVKP-14121](https://redhat.atlassian.net/browse/SRVKP-14121)
+**Status:** Active research and evaluation
 **Last Updated:** 2026-09-22
 
 ---
@@ -26,7 +26,7 @@ partial_retry/
 
 ## Document Map
 
-### Phase 1: Understanding Current State (✅ Complete)
+### Phase 1: Understanding Current State 
 
 **1. Architecture Analysis** (`research/architecture-analysis.md`)
 - **Purpose:** Document how Tekton works today
@@ -50,7 +50,7 @@ partial_retry/
 
 ---
 
-### Phase 2-3: Design Proposals (🚧 In Progress)
+### Phase 2-3: Design Proposals
 
 **4. Design Proposal** (`design/proposal.md`)
 - **Purpose:** Evaluate implementation approaches and document design decisions
@@ -81,39 +81,6 @@ partial_retry/
 
 ---
 
-## Key Design Decisions
-
-| Topic | Decision | Document | Status |
-|-------|----------|----------|--------|
-| **Object Model** | New PipelineRun per retry | `research/adr-new-object-model.md` | ✅ Decided |
-| **Failed Subgraph** | Rules for which tasks to re-run | `design/proposal.md` Part 5 | ✅ Defined |
-| **Result Re-injection** | Memoization via new spec field | `design/proposal.md` Part 6 | ✅ Defined |
-| **Planning Boundary** | Controller-side (API endpoint) | `design/proposal.md` Part 7 | ✅ Decided |
-| **Workspace Handling** | Pre-flight validation | `design/proposal.md` Part 8 | 🚧 Evaluating |
-| **Definition Stability** | Hybrid (inline specs + annotations) | `design/proposal.md` Part 9 | 🚧 Evaluating |
-| **Data Availability** | Phase 1: K8s-only, Phase 2: Results | `design/proposal.md` Part 10 | 🚧 Evaluating |
-| **API Shape** | Controller endpoint + new spec field | `design/proposal.md` Part 11 | 🚧 Evaluating |
-
----
-
-## Next Steps
-
-### Immediate (Stories 3.5-11)
-- [ ] Complete evaluation of all design options in `design/proposal.md`
-- [ ] Finalize recommendations for each evaluation section
-- [ ] Create visual diagrams for failed subgraph examples
-- [ ] Document side effect warning UX flows
-
-### TEP Authoring (Story 12)
-- [ ] Consolidate research + design into TEP format
-- [ ] Submit to `tektoncd/community` repository
-- [ ] Present at Tekton working group call
-
-### Implementation (Stories 13-14)
-- [ ] UI integration (Dashboard & Console)
-- [ ] CLI implementation (`tkn pipelinerun retry`)
-
----
 
 ## Related Links
 
@@ -124,11 +91,3 @@ partial_retry/
 
 ---
 
-## Legacy Files
-
-The following files are historical versions and can be archived:
-- `partial-pipelinerun-retry.md` - Original combined research+design document (now split into research/ and design/)
-- `partial-pipeline-run-retry-adr.md` - Older ADR version
-- `partial-pipeline-run-retry-adr-V1.md` - Older ADR version
-
-These files are kept for reference but superseded by the organized `research/` and `design/` structure.
