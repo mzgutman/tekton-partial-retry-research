@@ -246,18 +246,18 @@ When a user requests a retry, **who calculates which tasks to re-run**? Two fund
 - Retry-specific admission validation
 
 **Benefits:**
-- ✅ **Centralized logic:** All clients get identical retry behavior
-- ✅ **Consistent** across tkn, Dashboard, Console - no risk of divergent implementations
-- ✅ **Simpler client code:** Just make API call, don't implement complex graph traversal
-- ✅ **Server-side validation:** Controller validates PVC availability, result availability before creating retry
-- ✅ **Easier to update:** Fix a bug once in controller, all clients benefit immediately
+- **Centralized logic:** All clients get identical retry behavior
+- **Consistent** across tkn, Dashboard, Console - no risk of divergent implementations
+- **Simpler client code:** Just make API call, don't implement complex graph traversal
+- **Server-side validation:** Controller validates PVC availability, result availability before creating retry
+- **Easier to update:** Fix a bug once in controller, all clients benefit immediately
 
 **Drawbacks:**
-- ❌ **Controller complexity:** Adds new code path to already complex PipelineRun reconciler
-- ❌ **New API surface:** Requires designing/versioning a retry API (breaking change risk)
-- ❌ **Testing overhead:** Must test controller retry path in isolation from normal reconcile
-- ❌ **Tight coupling:** Retry logic embedded in controller lifecycle (harder to maintain separately)
-- ❌ **Does not align with K8s patterns:** Most K8s operations are declarative (apply YAML), not imperative (call endpoint)
+- **Controller complexity:** Adds new code path to already complex PipelineRun reconciler
+- **New API surface:** Requires designing/versioning a retry API (breaking change risk)
+- **Testing overhead:** Must test controller retry path in isolation from normal reconcile
+- **Tight coupling:** Retry logic embedded in controller lifecycle (harder to maintain separately)
+- **Does not align with K8s patterns:** Most K8s operations are declarative (apply YAML), not imperative (call endpoint)
 
 ---
 
@@ -270,18 +270,18 @@ When a user requests a retry, **who calculates which tasks to re-run**? Two fund
 - Controller unchanged (no retry-specific logic)
 
 **Benefits:**
-- ✅ **Simpler controller:** No new code paths, just normal reconcile
-- ✅ **Declarative model:** Retry is "apply new PipelineRun YAML" (fits K8s paradigm)
-- ✅ **Separation of concerns:** Retry planning separate from runtime execution
-- ✅ **Easier to prototype:** Can implement `tkn retry` without touching controller
-- ✅ **Lower risk:** Controller doesn't change, existing behavior unaffected
-- ✅ **Matches prior art:** Argo Workflows uses client-side (`argo retry` CLI computes, controller reconciles)
+- **Simpler controller:** No new code paths, just normal reconcile
+- **Declarative model:** Retry is "apply new PipelineRun YAML" (fits K8s paradigm)
+- **Separation of concerns:** Retry planning separate from runtime execution
+- **Easier to prototype:** Can implement `tkn retry` without touching controller
+- **Lower risk:** Controller doesn't change, existing behavior unaffected
+- **Matches prior art:** Argo Workflows uses client-side (`argo retry` CLI computes, controller reconciles)
 
 **Drawbacks:**
-- ❌ **Duplication risk:** Each client could reimplement logic independently (if library not used)
-- ❌ **Shared library required:** Must maintain `pkg/retry` with stable API
-- ❌ **Version skew:** Client library version might not match controller version
-- ❌ **Client must understand Tekton internals:** Graph traversal, result propagation, skip reasons
+- **Duplication risk:** Each client could reimplement logic independently (if library not used)
+- **Shared library required:** Must maintain `pkg/retry` with stable API
+- **Version skew:** Client library version might not match controller version
+- **Client must understand Tekton internals:** Graph traversal, result propagation, skip reasons
 
 ---
 
@@ -289,11 +289,11 @@ When a user requests a retry, **who calculates which tasks to re-run**? Two fund
 
 | System | K8s-Native? | Retry Orchestration | Notes |
 |--------|-------------|---------------------|-------|
-| **Argo Workflows** | ✅ Yes | **Client-side** | `argo retry` CLI computes memoized state, generates new Workflow YAML, applies it |
-| **GitHub Actions** | ❌ No (SaaS) | Server-side | API endpoint handles retry planning |
-| **GitLab CI** | ❌ No (SaaS) | Server-side | Backend recalculates pipeline state |
-| **CircleCI** | ❌ No (SaaS) | Server-side | API-driven retry |
-| **Jenkins** | ❌ No (pre-K8s) | Server-side | Master (controller) handles restart-from-stage |
+| **Argo Workflows** | ✓ Yes | **Client-side** | `argo retry` CLI computes memoized state, generates new Workflow YAML, applies it |
+| **GitHub Actions** | ✗ No (SaaS) | Server-side | API endpoint handles retry planning |
+| **GitLab CI** | ✗ No (SaaS) | Server-side | Backend recalculates pipeline state |
+| **CircleCI** | ✗ No (SaaS) | Server-side | API-driven retry |
+| **Jenkins** | ✗ No (pre-K8s) | Server-side | Master (controller) handles restart-from-stage |
 
 **Key insight:** The only Kubernetes-native system (Argo) uses **client-side orchestration**. SaaS systems use server-side, but they're not constrained by CRD immutability or K8s declarative patterns.
 
@@ -303,12 +303,12 @@ When a user requests a retry, **who calculates which tasks to re-run**? Two fund
 
 | Criterion | Option A (Controller) | Option B (Client) | Winner |
 |-----------|----------------------|-------------------|--------|
-| **Code Duplication** | ✅ Logic in one place (controller) | ⚠️ Requires shared library to avoid duplication across tkn/Dashboard/Console | **A** |
-| **Performance & Repeated Calculations** | ✅ Calculated once, cached in API response | ❌ Each client recalculates (CLI + Dashboard preview + Console UI = 3x work) | **A** |
-| **Consistency Across Clients** | ✅ All clients get identical results | ⚠️ Risk of version skew between client library versions | **A** |
-| **API Complexity** | ❌ New API endpoint, versioning, breaking change risk | ✅ No API changes, uses existing create PipelineRun | **B** |
-| **Debugging** | ⚠️ Server-side logic harder to inspect | ✅ Client generates YAML, users can inspect before apply | **B** |
-| **Transparency** | ❌ Retry plan hidden in API call | ✅ Generated PipelineRun YAML shows exactly what will run | **B** |
+| **Code Duplication** | ✓ Logic in one place (controller) |  Requires shared library to avoid duplication across tkn/Dashboard/Console | **A** |
+| **Performance & Repeated Calculations** | ✓ Calculated once, cached in API response | ✗ Each client recalculates (CLI + Dashboard preview + Console UI = 3x work) | **A** |
+| **Consistency Across Clients** | ✓ All clients get identical results |  Risk of version skew between client library versions | **A** |
+| **API Complexity** | ✗ New API endpoint, versioning, breaking change risk | ✓ No API changes, uses existing create PipelineRun | **B** |
+| **Debugging** |  Server-side logic harder to inspect | ✓ Client generates YAML, users can inspect before apply | **B** |
+| **Transparency** | ✗ Retry plan hidden in API call | ✓ Generated PipelineRun YAML shows exactly what will run | **B** |
 
 **Score: Option A wins 3/6 criteria, but wins on the most critical ones (performance, consistency, code duplication)**
 
@@ -334,7 +334,7 @@ When a user requests a retry, **who calculates which tasks to re-run**? Two fund
 - Validate result availability
 - Generate new PipelineRun YAML
 
-**Total work:** 4 calculations × 51 K8s API calls = **204 API calls**  
+**Total work:** 4 calculations × 51 K8s API calls = **204 API calls** 
 **CPU cost:** 4× subgraph computation, 4× result extraction
 
 ---
@@ -346,7 +346,7 @@ When a user requests a retry, **who calculates which tasks to re-run**? Two fund
    - Controller caches result for 5 minutes (or until PR state changes)
 2. **All subsequent clients** (tkn, Dashboard, Console, CI scripts) get **cached plan** → **0 recalculations**
 
-**Total work:** 1 calculation × 51 K8s API calls = **51 API calls**  
+**Total work:** 1 calculation × 51 K8s API calls = **51 API calls** 
 **CPU cost:** 1× subgraph computation, 1× result extraction
 
 ---
@@ -373,11 +373,11 @@ rules:
 ```
 
 **Security Properties:**
-- ✅ **Fine-grained control:** Can grant retry permission separately from create/delete
-- ✅ **Audit trail:** All retry requests logged server-side with user identity
-- ✅ **Policy enforcement:** Controller can enforce org policies (e.g., "no retries in prod namespace after 5pm")
-- ✅ **Immutable retry plan:** Server calculates plan, user cannot tamper with subgraph
-- ❌ **New attack surface:** `/retry` endpoint is new code path to secure
+- **Fine-grained control:** Can grant retry permission separately from create/delete
+- **Audit trail:** All retry requests logged server-side with user identity
+- **Policy enforcement:** Controller can enforce org policies (e.g., "no retries in prod namespace after 5pm")
+- **Immutable retry plan:** Server calculates plan, user cannot tamper with subgraph
+- **New attack surface:** `/retry` endpoint is new code path to secure
 
 **Example policy enforcement:**
 ```go
@@ -405,11 +405,11 @@ rules:
 ```
 
 **Security Properties:**
-- ✅ **No new attack surface:** Uses existing create permission
-- ✅ **Existing RBAC:** Reuses well-tested permission model
-- ❌ **No retry-specific audit:** Can't distinguish retry from new run in audit logs
-- ❌ **No policy enforcement:** Client-side validation can be bypassed by crafting YAML manually
-- ❌ **Coarse-grained:** If user can create PipelineRuns, they can retry (no separate permission)
+- **No new attack surface:** Uses existing create permission
+- **Existing RBAC:** Reuses well-tested permission model
+- **No retry-specific audit:** Can't distinguish retry from new run in audit logs
+- **No policy enforcement:** Client-side validation can be bypassed by crafting YAML manually
+- **Coarse-grained:** If user can create PipelineRuns, they can retry (no separate permission)
 
 **Risk scenario:**
 - User with `create pipelineruns` permission can retry failed prod pipeline by manually crafting YAML
@@ -450,89 +450,18 @@ rules:
 
 While Option B (client-side) aligns better with Kubernetes declarative principles and is used by Argo Workflows, it's suboptimal for Tekton's multi-client ecosystem. The performance cost of repeated calculations and the risk of version skew across 3+ client implementations outweigh the benefits of keeping the controller simple.
 
----
-
-### 7.6 Migration Path & Future Flexibility
-
-#### Can we switch from A → B later?
-
-**Difficulty:** ❌ **Hard**  
-If users and tools depend on the `/retry` API endpoint, removing it is a breaking change. Would require:
-- Deprecation period (6+ months)
-- Migration guide for all clients
-- Risk of breaking existing automation
-
-**Verdict:** Once we commit to Option A, we're locked in.
-
----
-
-#### Can we switch from B → A later?
-
-**Difficulty:** ✅ **Easy**  
-Add `/retry` endpoint as a convenience wrapper on top of client-side logic. Clients can continue to generate YAML directly if needed.
-
-**Verdict:** Starting with Option B preserves future flexibility.
-
----
-
-#### Hybrid Approach: Best of Both Worlds?
-
-**Is it possible?** ✅ **Yes**
-
-Implement both approaches:
-1. **Server provides `/retry` API** for consistency and performance (default path)
-2. **Clients can still generate YAML directly** for power users and offline scenarios
-
-**Example CLI UX:**
-```bash
-# Server-side (default) - calls /retry endpoint
-tkn pipelinerun retry pr-123
-
-# Client-side - generates and prints YAML without calling server
-tkn pipelinerun retry pr-123 --dry-run=client > retry.yaml
-kubectl apply -f retry.yaml
-
-# Server-side dry-run - calls /retry but doesn't create PR
-tkn pipelinerun retry pr-123 --dry-run=server
-```
-
-**Benefits:**
-- Default path (server-side) gives consistency and performance
-- Power users can inspect/modify generated YAML
-- Offline scenarios supported (e.g., air-gapped clusters)
-- Clients can implement retry logic independently if API unavailable
-
-**Cost:**
-- Must maintain both code paths
-- Clients still need shared retry library (but only for `--dry-run=client`)
-
----
-
-#### Recommendation: Hybrid Approach
-
-**Phase 1 (v1.0):**
-- Implement Option A (server-side `/retry` API)
-- Document the retry algorithm clearly
-
-**Phase 2 (v1.1):**
-- Extract retry logic to `pkg/retry` shared library
-- Add `--dry-run=client` to tkn CLI for power users
-- Dashboard continues using server API
-
-**Phase 3 (v1.2+):**
-- If needed, clients can generate YAML offline using shared library
-- Server API remains primary path
-
-This preserves flexibility while optimizing for the common case (multi-client consistency and performance).
-
-
 
 
 ---
 
+#### Hybrid Approach Possibility
 
+Both approaches can theoretically coexist:
+- Primary path: Server-side `/retry` API (default, optimized for consistency)
+- Optional path: Client-side generation (for preview, customization, air-gapped scenarios)
 
-
+**For v1, the recommended option is : Server-side only (Option A).** Hybrid capabilities can be added in future versions if user demand justifies the complexity.
+---
 
 
 ## Related Documents
