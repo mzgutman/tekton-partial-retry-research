@@ -83,12 +83,29 @@ the partial retry logic does not recursively traverse down into the nested DAG.
 
 **Original Pipeline Execution:**
 
-A ✓ ──────► B ✗ ──────► D ⊘ (ParentTasksSkip)
-│           (onError:    │
-│            continue)   │
-└─────► C ✓ ────────► E ✓ ────► F ⊘ (ParentTasksSkip)
-                       │
-                       $(tasks.B.results.data)
+```mermaid
+graph LR
+    A[A: build ✓] --> B[B: test ✗<br/>onError: continue]
+    A --> C[C: lint ✓]
+    B --> D[D: deploy-staging ⊘<br/>ParentTasksSkip]
+    C --> E[E: report ✓<br/>uses B result]
+    E --> F[F: deploy-prod ⊘<br/>ParentTasksSkip]
+    
+    style A fill:#90EE90
+    style B fill:#FFB6C6
+    style C fill:#90EE90
+    style D fill:#D3D3D3
+    style E fill:#90EE90
+    style F fill:#D3D3D3
+    
+    subgraph finally
+        cleanup[cleanup ✓]
+        notify[notify ✓]
+    end
+    
+    style cleanup fill:#90EE90
+    style notify fill:#90EE90
+```
                 
 **Task States:**
 - **A** : ✓ Succeeded
@@ -115,12 +132,36 @@ A ✓ ──────► B ✗ ──────► D ⊘ (ParentTasksSkip)
 
 **Retry Execution:**
 
-[A reused] ──► B ⟳ ──────► D ⟳
-│                          │
-│                          │
-└─────► [C reused] ──► [E reused] ──► F ⟳
-                           │
-                           (uses stale B result)
+```mermaid
+graph LR
+    A[A: reused ✓] -.-> B[B: retry ⟳]
+    A -.-> C[C: reused ✓]
+    B --> D[D: retry ⟳]
+    C -.-> E[E: reused ✓<br/>stale B result]
+    E --> F[F: retry ⟳]
+    
+    style A fill:#87CEEB,stroke:#4682b4,stroke-width:2px,stroke-dasharray: 5 5
+    style B fill:#FFD700
+    style C fill:#87CEEB,stroke:#4682b4,stroke-width:2px,stroke-dasharray: 5 5
+    style D fill:#FFD700
+    style E fill:#87CEEB,stroke:#4682b4,stroke-width:2px,stroke-dasharray: 5 5
+    style F fill:#FFD700
+    
+    subgraph finally
+        cleanup[cleanup ⟳]
+        notify[notify ⟳]
+    end
+    
+    style cleanup fill:#FFD700
+    style notify fill:#FFD700
+```
+
+**Legend:**
+- 🟢 **Green (solid)**: Succeeded in original run
+- 🔴 **Pink**: Failed in original run
+- ⚪ **Gray**: Skipped (cascade)
+- 🔵 **Blue (dashed)**: Reused in retry
+- 🟡 **Yellow**: Re-executed in retry
                     
 
 **Key Observations:**
@@ -170,21 +211,7 @@ A ✓ ──────► B ✗ ──────► D ⊘ (ParentTasksSkip)
 - **Action:** For v1, accept this limitation. Warn user that nested pipelines retry fully.
 - **Future Work:** Recursive subgraph computation for nested pipelines
 
-**Edge Case 7: Task exhausted retries in original run**
-- **Original:** Task with `retries: 3` failed after 4 total attempts (initial + 3 retries)
-- **Retry:** Task is in the failed subgraph (Rule 1a)
-- **Behavior:** New `PipelineRun` gives the task a **fresh** `retries: 3` budget (Rule 9)
-- **Action:** Task can attempt up to 4 more executions in the retry run
-- **User Warning:** CLI/UI should show: "Task 'X' previously exhausted 3 retries. 
-  Retry will grant fresh retry budget."
 
-**Edge Case 8: Pipeline cancelled mid-execution**
-- **Original:** Pipeline cancelled while tasks B, C were still running (`Status: Unknown`)
-- **Subgraph:** B and C added to rerun set (Rule 1b - not explicitly True)
-- **Behavior:** All interrupted tasks retry from scratch
-- **Action:** Accept retry request. Tasks with partial side effects (e.g., wrote half a file to PVC) 
-  may cause issues if not idempotent.
-- **User Warning:** "Pipeline was cancelled mid-execution. Some tasks may have partial side effects."
 
 
 ## Part 6 — Design: Result Re-injection (Memoization)
