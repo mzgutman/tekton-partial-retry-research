@@ -463,6 +463,104 @@ Both approaches can theoretically coexist:
 **For v1, the recommended option is : Server-side only (Option A).** Hybrid capabilities can be added in future versions if user demand justifies the complexity.
 ---
 
+## Part 8 — Design Evaluation: Workspace PVC Handling
+
+Workspace data persistence (specifically persistent volume claims attached via Tekton's `AffinityAssistant`) is a primary challenge for partial retries. When downstream tasks are retried, they often depend on data left in a workspace by an upstream task that is being bypassed.
+
+---
+
+### 8.1 Key Workspace & PVC Challenges
+
+1. **Affinity Assistant Cleanup on Failure:** By default, Tekton's Affinity Assistant manages pod co-location and PVC lifecycles. On `PipelineRun` failure, the controller cleans up Affinity Assistant resources.
+2. **PVC Auto-Deletion (`AffinityAssistantPerPipelineRun`):** Under `AffinityAssistantPerPipelineRun` mode, the underlying PVC is bound strictly to the single `PipelineRun` lifecycle and is deleted immediately upon pipeline completion.
+3. **The Race Condition:** In automated pipelines, PVC deletion happens within seconds of failure. A human engineer executing `tkn pipelinerun retry` 15 minutes later will find that the workspace data is already destroyed, leading to runtime pod mounting failures.
+
+---
+
+### 8.2 Affinity Assistant Mode Behavior Matrix
+
+| Mode / PVC Type | PVC Ownership | Deletion Trigger | Partial Retry Impact |
+|:---|:---|:---|:---|
+| **`AffinityAssistantPerPipelineRun`** | StatefulSet VolumeClaimTemplate | `PipelineRun` completion/failure (immediate) |  **Blocks Retry:** Data lost immediately. |
+| **`AffinityAssistantPerWorkspace`** | Tekton Controller directly | Auto-cleaned if `tekton.dev/auto-cleanup-pvc=true` |  **Conditional:** Retries work unless auto-cleanup is enabled. |
+| **`AffinityAssistantDisabled`** | Tekton Controller directly | Manual cleanup required |  **Allows Retry:** Data preserved indefinitely. |
+| **User-Provided PVC** (`persistentVolumeClaim`) | External K8s resource | Managed by cluster administrator |  **Allows Retry:** Data preserved across runs. |
+
+---
+
+### 8.3 Strategy Evaluation for Workspace Preservation
+
+#### Option A: Immediate Mode Restrictions
+Restrict partial retry functionality exclusively to pipelines configured with `AffinityAssistantPerWorkspace` (without auto-cleanup), `AffinityAssistantDisabled`, or user-provided PVCs. If a user attempts to retry a pipeline using `AffinityAssistantPerPipelineRun`, the request is rejected immediately at creation time.
+
+* **Pros:** Simple, reliable, zero risk of runtime volume-mount failures due to missing PVCs.
+* **Cons:** Inflexible. Users with default Tekton configurations (`PerPipelineRun`) cannot use partial retries without changing global cluster flags or pipeline definitions.
+
+#### Option B: Pre-Flight Validation + Clear Error Messages
+Allow retry requests across all modes, but perform an active pre-flight check against the Kubernetes API to confirm that the required PVC still exists and is in a `Bound` state before generating the retry `PipelineRun`.
+
+* **Pros:** Excellent user experience. Provides fast, actionable failure messages (e.g., *"Cannot retry: Workspace PVC 'ws-123' was deleted. Switch to AffinityAssistantPerWorkspace or user-provided PVCs to retain workspace state across retries."*).
+* **Cons:** Does not save data that has already been deleted; only gracefully handles the failure.
+
+#### Option C: Deferred Cleanup with Retry Window
+Modify the Tekton controller to introduce a configurable retention delay (TTL) on `AffinityAssistant` and PVC deletion following a `PipelineRun` failure (e.g., `retentionWindow: 2h`).
+
+* **Pros:** Solves the race condition for default configurations. Gives operators a window to trigger retries before garbage collection runs.
+* **Cons:** Adds significant controller complexity (timer/queue management, delayed reconciliation). Consumes storage resources for failed runs that may never be retried.
+
+#### Option D: Retry-Specific Workspace Re-creation
+If required workspace data is lost (PVC missing), the retry algorithm automatically adds the upstream "workspace-producer" tasks (e.g., git-clone) back into the failed subgraph to re-populate the workspace before running the failed tasks.
+
+* **Pros:** Enables retries even if the original PVC was destroyed.
+* **Cons:** Extremely difficult to determine statically which upstream tasks produced which workspace files. Highly prone to edge-case failures if producer tasks have side effects.
+    Example:
+      Pipeline: clone → build → test (fails)
+      
+      Which task "produced" /workspace/source?
+      - clone writes initial files
+      - build writes compiled artifacts to same workspace
+      
+      If we re-run only clone, we lose build artifacts.
+      If we re-run clone+build, we waste compute.
+      Static analysis cannot determine this reliably.
+
+---
+
+### 8.4 Evaluation Summary & Recommendations
+
+| Criterion | Option A (Mode Restrictions) | Option B (Pre-flight Checks) | Option C (Deferred Cleanup) | Option D (Workspace Re-creation) |
+|:---|:---:|:---:|:---:|:---:|
+| **Implementation Effort** | Low | Low | High | Very High |
+| **Data Guarantee** | High | High (Validation) | Medium (Time-bound) | Low (Heuristic) |
+| **Controller Complexity** | Low | Low | High | Extremely High |
+| **User UX Clarity** | Clear rejection | Clear error message | Silent expiry after TTL | Potentially unexpected task execution |
+
+#### Recommendation for v1: Hybrid Option A + Option B
+
+1. **Enforce Option A & B for v1:** Combine pre-flight checks with mode validation. The controller/CLI validates that all required PVCs exist and are `Bound`. If a PVC was deleted due to `AffinityAssistantPerPipelineRun` or garbage collection, reject the retry immediately with a clear error message explaining how to configure workspaces for retries.
+2. **Defer Option C to Phase 2:** Explore a configurable TTL window (`retentionWindow`) in a future release if user telemetry shows `PerPipelineRun` cleanup is a major blocker for retry adoption.
+3. **Reject Option D:** Statically inferring workspace dependencies is too fragile for core Tekton reconciler logic.
+
+---
+
+### 8.5 Workspace Staleness & Side Effect Warnings
+
+#### Workspace Content Staleness (Known Risk)
+If a pipeline task succeeds, is bypassed, and its workspace data is reused in a retry, the data reflects the state at the time of the *original* failure. If external state changed in the interim (e.g., a developer pushed new commits to the remote Git branch), the retried task will operate on the old workspace contents.
+* **Mitigation:** Document this immutability contract clearly. Pre-flight CLI/UI warnings should remind users that retried tasks execute against preserved workspace snapshots.
+
+#### Mandatory Side Effect Warning
+Because Tekton cannot automatically guarantee task idempotency, interactive clients (`tkn` CLI, Tekton Dashboard, Console) must prompt the user prior to triggering a retry:
+
+```text
+    WARNING: Partial retry will re-execute failed tasks and reuse existing workspace PVCs.
+    If tasks have non-idempotent side effects, re-execution may duplicate actions:
+    - Deployments may duplicate external resources
+    - Workspace contents reflect the state at original execution time
+    
+    Do you want to proceed? [y/N]
+    
+```
 
 ## Related Documents
 

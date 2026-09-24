@@ -1,9 +1,9 @@
 # Tekton Architecture Analysis for Partial PipelineRun Retry
 
-> **Document Type:** Research & Analysis  
-> **Status:** Completed  
-> **Last Updated:** 2026-09-22  
-> **Jira Epic:** [SRVKP-14121](https://redhat.atlassian.net/browse/SRVKP-14121)  
+> **Document Type:** Research & Analysis 
+> **Status:** Completed 
+> **Last Updated:** 2026-09-22
+> **Jira Epic:** [SRVKP-14121](https://redhat.atlassian.net/browse/SRVKP-14121) 
 > **Foundational Spike:** [SRVKP-14219](https://redhat.atlassian.net/browse/SRVKP-14219)
 
 ---
@@ -12,13 +12,13 @@
 
 This document analyzes the current Tekton Pipelines implementation to establish a technical foundation for designing partial PipelineRun retry functionality. It describes **how Tekton works today**, without proposing design changes.
 
-**Scope:**  
+**Scope:** 
 - Tekton custom resource definitions (CRDs) and their relationships
 - Controller architecture and reconciliation logic
 - DAG-based scheduling and execution queue semantics
 - Known implementation constraints that impact retry design
 
-**Out of Scope:**  
+**Out of Scope:** 
 - Design proposals for partial retry (see `design/proposal.md`)
 - Prior art analysis (see `research/prior-art-analysis.md`)
 
