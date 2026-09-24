@@ -553,7 +553,7 @@ If a pipeline task succeeds, is bypassed, and its workspace data is reused in a 
 Because Tekton cannot automatically guarantee task idempotency, interactive clients (`tkn` CLI, Tekton Dashboard, Console) must prompt the user prior to triggering a retry:
 
 ```text
-    WARNING: Partial retry will re-execute failed tasks and reuse existing workspace PVCs.
+WARNING: Partial retry will re-execute failed tasks and reuse existing workspace PVCs.
     If tasks have non-idempotent side effects, re-execution may duplicate actions:
     - Deployments may duplicate external resources
     - Workspace contents reflect the state at original execution time
@@ -561,6 +561,296 @@ Because Tekton cannot automatically guarantee task idempotency, interactive clie
     Do you want to proceed? [y/N]
     
 ```
+
+---
+## Part 9 — Design Evaluation: Pipeline Definition Stability - TO DO
+
+---
+
+## Part 10 — Design Evaluation: Data Availability Strategies
+
+### 10.1 The Pruning Timeline (Expanded from Part 6.3)
+
+**Kubernetes garbage collection phases:**
+
+```
+t=0     PipelineRun completes (Succeeded or Failed)
+t+1h    TaskRun pods deleted (completed pods pruned quickly)
+t+24h   TaskRuns pruned from etcd (default TTL-after-finished)
+        └─ TaskRun.Status.Results[] lost if not bubbled up
+t+7d    PipelineRuns pruned from etcd
+        └─ PipelineRun.Status.Results[] lost
+t+90d   Tekton Results records expire (configurable)
+```
+
+**Time window for retry:**
+- **Phase 1 (K8s-only):** Hours to ~1 day (until TaskRuns pruned)
+- **Phase 2 (with Results):** Weeks to months (until Results records expire)
+
+### 10.2 Phase 1 Validation Approaches
+
+**Option A — Pre-flight validation (fail fast):**
+```go
+// At retry-request time
+validateRetryAvailability(originalPR) error {
+    // Check 1: PipelineRun still exists
+    if originalPR not found → return "PipelineRun pruned, cannot retry"
+    
+    // Check 2: Required TaskRuns exist
+    for each bypassed task:
+        tr := getTaskRun(task)
+        if tr == nil:
+            if result bubbled up → OK
+            else → return "TaskRun pruned, result not bubbled up"
+    
+    return nil
+}
+```
+
+**Benefits:**
+- User gets instant feedback
+- Clear error message with actionable guidance
+- No wasted work (don't create retry if it will fail)
+
+**Drawbacks:**
+- Requires checking each TaskRun (N API calls for N bypassed tasks)
+- Race condition: TaskRun could be pruned between validation and retry creation
+
+**Option B — Best-effort (fail during reconcile):**
+- Allow retry creation without validation
+- Fail during ResolveResultRef() when result unavailable
+- ValidationFailedTask → PipelineRun fails
+
+**Benefits:**
+- Simple - no validation logic
+- Reuses existing result resolution code
+
+**Drawbacks:**
+- Poor UX - failure happens during execution, not immediately
+- Wasted reconcile loops before failure detected
+
+**Recommended:** **Option A** - pre-flight validation with clear error messages.
+
+### 10.3 Phase 2: Tekton Results Integration Strategy
+
+**Option A: Mandatory Tekton Results for Retry**
+
+Partial retry only works if Tekton Results is installed and configured.
+
+**Implementation:**
+- Controller checks Results availability at startup
+- Retry endpoint returns 501 Not Implemented if Results not configured
+- All result extraction goes through Results API
+
+**Pros:**
+- Simple mental model (retry = requires Results)
+- No ambiguity about data source
+- Can enforce retention policies centrally
+
+**Cons:**
+- Cannot use retry without Results (blocks adoption)
+- Tight coupling between core Pipelines and Results
+- Results becomes a required dependency (was optional)
+
+---
+
+**Option B: Optional Tekton Results as Fallback**
+
+Results is used opportunistically if available, but not required.
+
+**Implementation:**
+- Three-tier lookup: TaskRun.Status → PipelineRun.Status → Results API (if available)
+- If Results not installed, retry fails gracefully with clear error
+- Feature flag: `tekton.dev/results-enabled`
+
+**Pros:**
+- Loose coupling (Results remains optional)
+- Works in environments without Results
+- Gradual adoption path
+
+**Cons:**
+- Complex fallback logic
+- Inconsistent behavior (works sometimes, not others)
+- Users confused about when retry works
+
+---
+
+**Option C: Hybrid with Pre-flight Validation**
+
+Validate data availability before retry, fail with clear guidance.
+
+**Implementation:**
+- At retry-request time, check:
+  1. Are required TaskRuns still in etcd?
+  2. Are results bubbled up to PipelineRun.Status?
+  3. If not, is Results installed?
+- Reject retry early if data unavailable
+- Error message guides user to solution (bubble up results or install Results)
+
+**Pros:**
+- Clear user feedback (fail fast)
+- Transparent about data requirements
+- Users understand why retry failed
+
+**Cons:**
+- Validation adds overhead
+- Multiple code paths to maintain
+
+### 10.3.1 Evaluation Matrix: Phase 2 Options
+
+| Criterion | Option A (Mandatory) | Option B (Optional Fallback) | Option C (Hybrid Validation) | Winner |
+|-----------|---------------------|------------------------------|------------------------------|--------|
+| **Ease of Adoption** | ✗ Blocks retry without Results | ✓ Works in K8s-only environments | ✓ Clear guidance, graceful degradation | **C** |
+| **Implementation Complexity** | ✓ Simple (single code path) | ✗ Complex (three-tier lookup) | Medium (validation logic) | **A** |
+| **User Clarity** | ✓ Clear requirement (Results or no retry) | ✗ Confusing (works sometimes, not others) | ✓ Fail-fast with actionable errors | **C** |
+| **Results Coupling** | ✗ Tight (Results becomes required) | ✓ Loose (Results remains optional) | ✓ Loose (Results optional but recommended) | **B** |
+| **Long-term Retry Window** | ✓ Weeks to months | Depends on bubbling strategy | Depends on bubbling strategy | **A** |
+| **Consistency** | ✓ Predictable behavior | ✗ Behavior varies by environment | ✓ Predictable (validated before retry) | **A** |
+
+**Score: Option C wins 3/6 criteria, balancing adoption, clarity, and loose coupling**
+
+### 10.3.2 Recommended Approach: Option C (Hybrid Validation)
+
+**For v1: Pre-flight validation with optional Results fallback (Option C)**
+
+#### Rationale
+
+1. **Fail-fast with clear guidance:** Users know immediately if their retry will work, with actionable error messages pointing them to solutions (bubble up results or install Results).
+
+2. **Doesn't block adoption:** Works in K8s-only environments for short retry windows (hours), while enabling longer windows (weeks) for Results-enabled clusters.
+
+3. **Loose coupling:** Results remains an optional companion project, not a hard dependency.
+
+4. **Transparent behavior:** Validation logic makes it obvious why a retry succeeded or failed (no hidden "works sometimes" magic).
+
+#### Implementation Path
+
+**Phase 1 (v1.0):** 
+- Pre-flight validation (check TaskRun availability, result bubbling)
+- Reject with clear error if data unavailable
+- No Results integration yet
+
+**Phase 2 (v1.1+):**
+- Add Results API query as tertiary lookup tier
+- Feature flag: `tekton.dev/enable-results-fallback`
+- Document bubbling strategy in official retry guide
+
+### 10.4 Error Message Design
+
+**For each failure scenario:**
+
+| Scenario | Error Message |
+|----------|---------------|
+| **PipelineRun pruned** | `Cannot perform partial retry: Original PipelineRun 'pr-123' no longer exists in cluster. Full re-run required.` |
+| **TaskRun pruned, result not bubbled** | `Cannot perform partial retry: Result 'clone.commit-sha' unavailable. TaskRun was pruned and result not bubbled up.\n\nTo enable retry after GC:\n  1. Bubble up results to Pipeline level (declare Pipeline.spec.results), OR\n  2. Install Tekton Results (Phase 2 feature)` |
+| **TaskRun manually deleted** | `Cannot perform partial retry: TaskRun 'pr-123-clone' was deleted. Result data lost.\n\nPartial retry after manual TaskRun deletion is not supported. Full re-run required.` |
+| **Results unavailable (Phase 2)** | `Cannot perform partial retry: Tekton Results API unavailable or record expired.\n\nFull re-run required.` |
+
+---
+### 10.5 Three-Tier Lookup Implementation (Phase 2)
+
+When a retry PipelineRun needs to resolve a result reference from a bypassed task, the controller performs a **three-tier lookup**:
+
+```go
+ResolveResultRef(pipelineRunState, resultRef) (string, error) {
+    taskName := resultRef.PipelineTask
+    resultName := resultRef.Result
+    
+    // Tier 1: Live state (task actually ran in this retry)
+    if task := pipelineRunState[taskName]; task != nil && task.TaskRun != nil {
+        if result := task.TaskRun.Status.Results[resultName]; result != "" {
+            return result, nil  // Fresh result from this retry
+        }
+    }
+    
+    // Tier 2: Memoized state (bubbled-up results from original PR)
+    if pr.Spec.RetriedTaskResults[taskName][resultName] != "" {
+        return pr.Spec.RetriedTaskResults[taskName][resultName], nil
+    }
+    
+    // Tier 3: Tekton Results API (Phase 2, if enabled)
+    if resultsEnabled && originalPR.Annotations["tekton.dev/original-pr-uid"] != "" {
+        if result, err := queryResultsAPI(originalPR.UID, taskName, resultName); err == nil {
+            return result, nil
+        }
+    }
+    
+    // All tiers failed
+    return "", ErrResultNotFound  // Triggers ValidationFailedTask
+}
+```
+
+**Tier Priority Rationale:**
+1. **Tier 1 first:** Fresh execution in current retry always wins (prevents stale data)
+2. **Tier 2 second:** Bubbled-up results survive pruning, faster than API call
+3. **Tier 3 last:** External API query (latency cost, requires network/auth)
+
+---
+
+### 10.6 Result Bubbling Strategy (User Guidance)
+
+To maximize retry window after TaskRun pruning, users should **bubble up results** to the Pipeline level:
+
+```yaml
+# Pipeline definition
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: build-and-deploy
+spec:
+  tasks:
+    - name: clone
+      taskRef:
+        name: git-clone
+  results:
+    - name: commit-sha          # Declare at Pipeline level
+      description: Git commit SHA
+      value: $(tasks.clone.results.commit)  # Reference TaskRun result
+```
+
+**Effect:** When TaskRun `clone` is pruned, `commit-sha` persists in `PipelineRun.Status.Results[]` for the life of the PipelineRun (typically 7 days vs. 24 hours for TaskRuns).
+
+**Documentation note:** Retry guide should include a "Best Practices" section recommending bubbling for all results referenced by downstream tasks.
+
+---
+
+### 10.7 Results API Query Implementation (Phase 2)
+
+**Query pattern:**
+```go
+func queryResultsAPI(originalPRUID, taskName, resultName string) (string, error) {
+    // Construct Results API query
+    client := resultsClient()
+    record, err := client.GetRecord(context.Background(), &pb.GetRecordRequest{
+        Name: fmt.Sprintf("default/results/%s/records/%s-%s", originalPRUID, originalPRUID, taskName),
+    })
+    if err != nil {
+        return "", fmt.Errorf("Results API unavailable: %w", err)
+    }
+    
+    // Extract result from TaskRun record
+    taskRun := &v1.TaskRun{}
+    if err := proto.Unmarshal(record.Data.Value, taskRun); err != nil {
+        return "", err
+    }
+    
+    for _, result := range taskRun.Status.Results {
+        if result.Name == resultName {
+            return result.Value.StringVal, nil
+        }
+    }
+    
+    return "", fmt.Errorf("result %s not found in archived TaskRun", resultName)
+}
+```
+
+**Considerations:**
+- **Authentication:** Results API requires gRPC client credentials
+- **Latency:** External API call adds 50-200ms per result lookup
+- **Caching:** Controller should cache Results API responses per reconcile loop
+- **Feature flag:** `tekton.dev/enable-results-fallback=true` (default: false for v1)
+
+---
 
 ## Related Documents
 
