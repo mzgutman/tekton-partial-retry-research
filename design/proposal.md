@@ -852,6 +852,587 @@ func queryResultsAPI(originalPRUID, taskName, resultName string) (string, error)
 
 ---
 
+
+## Part 11 — Design Evaluation: API Shape, Security & Provenance
+
+### 11.1 API Shape (Aligned with Part 7 Recommendation)
+
+**Decision from Part 7:** Controller/API calculates (Option A - server-side orchestration)
+
+**Rationale:** See Part 7.5 for complete evaluation. Summary: Option A chosen for performance (4× efficiency), consistency across clients, single implementation, and better audit trail.
+
+This section details the API design, security model, and provenance tracking for the controller-side approach.
+
+---
+
+#### API Endpoint Design
+
+**Implementation:** New API endpoint for retry orchestration
+
+**API Endpoint:**
+```
+POST /apis/tekton.dev/v1/namespaces/{ns}/pipelineruns/{name}/retry
+{
+  "failedOnly": true,
+  "dryRun": false  // Optional: preview what would be retried
+}
+
+Response:
+{
+  "retryPipelineRun": "pr-123-retry-1",
+  "rerunTasks": ["test", "scan", "deploy"],
+  "preservedTasks": ["clone", "build"],
+  "warnings": ["Task 'deploy' has side effects - may create duplicate resources"]
+}
+```
+
+**Generated PipelineRun Structure:**
+
+The controller creates a new PipelineRun with:
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: pr-123-retry-1
+  annotations:
+    tekton.dev/retryOf: "original-pr-uid-abc"  # Links to original
+    tekton.dev/retryAttempt: "1"                # Retry sequence number
+spec:
+  pipelineRef:
+    name: my-pipeline
+  # Controller injects memoized results
+  retriedTaskResults:
+    - pipelineTaskName: clone
+      results:
+        - name: commit-sha
+          value: "abc123def456"
+    - pipelineTaskName: build
+      results:
+        - name: image-digest
+          value: "sha256:789..."
+  params: [...]
+  workspaces: [...]
+```
+
+**Key characteristics:**
+- Controller performs all computation (subgraph, result extraction, validation)
+- Clients (tkn, Dashboard, Console) are thin wrappers around API call
+- Single source of truth for retry plan
+- Consistent behavior across all clients
+
+---
+
+#### Alternatives Evaluated in Part 7
+
+**Option B: Client-Side Generation** - Evaluated and rejected. See Part 7.3 and 7.5 for full analysis.
+- Summary: Client generates PipelineRun YAML and applies to cluster
+- Rejected due to: Repeated calculations, version skew risk, consistency concerns
+- Note: Would require admission webhook validation for security (detailed in Section 11.2)
+
+**Option C: Declarative Annotation** - Deferred to v2. See Section 11.6 for future consideration.
+- Summary: `tekton.dev/auto-retry` annotation triggers automatic retry
+- Deferred due to: Lack of user confirmation flow for side effects
+- Future use case: Fully automated CI/CD pipelines
+
+---
+
+### 11.2 Security & RBAC Analysis
+
+#### Cross-Run Access Control
+
+**Question:** Should caller need read access to original PipelineRun to retry it?
+
+**Answer:** **Yes** - retry is effectively "read original state + create new run"
+
+**RBAC requirements:**
+```yaml
+# Minimum permissions for retry
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+rules:
+  # Read original PipelineRun + TaskRuns
+  - apiGroups: ["tekton.dev"]
+    resources: ["pipelineruns", "taskruns"]
+    verbs: ["get", "list"]
+  
+  # Create retry PipelineRun
+  - apiGroups: ["tekton.dev"]
+    resources: ["pipelineruns"]
+    verbs: ["create"]
+```
+
+#### Cross-Namespace Retries
+
+**Question:** Should retries across namespaces be allowed?
+
+**Scenario:**
+```
+Namespace A: pr-production (failed)
+Namespace B: pr-production-retry (retry attempt by different team)
+```
+
+**Answer:** **No** - explicitly block cross-namespace retries.
+
+**Rationale:**
+1. Security boundary - namespace isolation is fundamental to K8s
+2. Service accounts don't cross namespaces
+3. PVC/workspace access would fail
+4. Result forwarding across namespaces = unauthorized data access
+
+**Validation:** Retry PipelineRun must be created in same namespace as original.
+
+#### Result Access Authorization
+
+**Question:** Can retry bypass result access controls?
+
+**Attack scenario:**
+```
+User A: Cannot read original PipelineRun 'pr-secret' (contains secret results)
+User A: Creates retry of 'pr-secret' → gets results via Spec.retriedTaskResults?
+```
+
+**Mitigation:**
+- Admission webhook validates: `CREATE retry-pr` → requires `GET original-pr` permission
+- If user lacks read access to original → retry creation rejected
+
+---
+
+#### Admission Controller Validation
+
+**Validation webhook must enforce:**
+
+1. **Retry metadata consistency:**
+   ```yaml
+   if annotations["tekton.dev/retryOf"] exists:
+     - Original PipelineRun must exist
+     - Original PipelineRun must be in terminal state
+     - Caller must have GET permission on original PR
+   ```
+
+2. **Spec.retriedTaskResults validation:**
+   ```yaml
+   if spec.retriedTaskResults exists:
+     - Verify taskNames match original Pipeline spec
+     - Verify result names match Task definitions
+     - Reject if results contain suspicious values (injection attack)
+   ```
+
+3. **Workspace binding stability:**
+   ```yaml
+   if workspace PVC referenced:
+     - Verify PVC exists and is Bound
+     - Warn if PVC is not the original's PVC (staleness risk)
+   ```
+
+4. **Namespace isolation:**
+   ```yaml
+   if annotations["tekton.dev/retryOf"] exists:
+     - Original PR must be in same namespace
+     - Reject cross-namespace retries
+   ```
+
+**Rejection example:**
+```json
+{
+  "apiVersion": "admission.k8s.io/v1",
+  "kind": "AdmissionReview",
+  "response": {
+    "allowed": false,
+    "status": {
+      "code": 403,
+      "message": "Retry validation failed: Original PipelineRun 'pr-123' not found or caller lacks GET permission"
+    }
+  }
+}
+```
+
+---
+
+### 11.3 SLSA Provenance Requirements
+
+**Core requirement:** Provenance must distinguish **inherited** work from **newly executed** work.
+
+#### Provenance Contract for Chains
+
+**For bypassed (reused) tasks:**
+```json
+{
+  "taskName": "clone",
+  "status": "succeeded",
+  "inheritedFrom": {
+    "pipelineRun": "pr-123",
+    "pipelineRunUID": "abc-def-123",
+    "taskRun": "pr-123-clone",
+    "taskRunUID": "xyz-789",
+    "originalCompletionTime": "2026-09-01T10:30:00Z"
+  },
+  "executedInRetry": false,  // Not executed in this run
+  "results": {
+    "commit-sha": "abc123"  // Mark as inherited
+  }
+}
+```
+
+**For re-run tasks:**
+```json
+{
+  "taskName": "test",
+  "status": "succeeded",
+  "executedInRetry": true,    // Executed fresh in this run
+  "retryOf": {
+    "pipelineRun": "pr-123",
+    "previousStatus": "failed"
+  },
+  "results": {
+    "test-report": "junit.xml"  // Fresh result
+  }
+}
+```
+
+#### Status Field Design
+
+**To enable Chains to detect retry context:**
+
+```yaml
+status:
+  # Existing fields
+  conditions: [...]
+  childReferences: [...]
+  
+  # New field for retry metadata
+  retryMetadata:
+    retryOf: "pr-123-uid"
+    retryAttempt: 1
+    preservedTasks: ["clone", "build"]  # Inherited from original
+    rerunTasks: ["test", "scan", "deploy"]  # Fresh execution
+```
+
+This allows provenance producers to:
+1. Detect this is a retry run
+2. Identify which tasks were inherited vs. fresh
+3. Link provenance back to original run
+
+---
+
+### 11.4 User Experience Design
+
+**Note:** All UX flows are based on the **controller endpoint approach** (Option A). The CLI, Dashboard, and Console are all thin clients that call `POST /retry`.
+
+#### 11.4.1 CLI Flows
+
+**Basic retry:**
+```bash
+$ tkn pipelinerun retry pr-123
+
+# Behind the scenes: tkn calls POST /apis/tekton.dev/v1/namespaces/default/pipelineruns/pr-123/retry
+
+WARNING: This will retry 3 failed tasks and reuse 5 successful tasks.
+    
+    Tasks to re-run:
+      • test (failed)
+      • scan (ParentTasksSkip)
+      • deploy (ParentTasksSkip)
+    
+    Tasks to reuse:
+      • clone (commit-sha: abc123...)
+      • build (image-digest: sha256:789...)
+      • lint (exit-code: 0)
+    
+      Workspace 'source' will be reused from original run
+        (may contain stale data if source changed)
+    
+      Task 'deploy' may have side effects
+        Re-running may create duplicate resources
+    
+    Continue? [y/N]: y
+
+Creating retry PipelineRun 'pr-123-retry-1'...
+Started: https://dashboard.example.com/pr-123-retry-1
+```
+
+**CLI flag behavior:**
+
+The `--failed-only` flag is **the default behavior** of the `retry` subcommand. It is included in the signature for explicit clarity and to enable a potential future `--full` flag.
+
+```bash
+# These are equivalent (both retry only failed tasks):
+tkn pipelinerun retry pr-123
+tkn pipelinerun retry pr-123 --failed-only
+
+# Future consideration (not in v1):
+tkn pipelinerun retry pr-123 --full  # Re-run entire pipeline
+```
+
+If users want to re-run the entire pipeline (ignoring the failed subgraph), they should use:
+```bash
+tkn pipelinerun start --from-pipelinerun pr-123  # Full rerun with same params
+```
+
+**Dry-run mode:**
+```bash
+$ tkn pipelinerun retry pr-123 --dry-run
+
+# Behind the scenes: tkn calls POST /retry with {"dryRun": true}
+# Controller returns the plan without creating the PipelineRun
+
+Retry plan for 'pr-123':
+  Original run: pr-123 (Failed at 2026-09-27 08:00:00)
+  
+  Re-run tasks (3):
+    ✗ test → ValidationFailed (missing result from 'build')
+    ⊘ scan → ParentTasksSkip
+    ⊘ deploy → ParentTasksSkip
+  
+  Reuse tasks (5):
+    ✓ clone
+    ✓ build
+    ✓ lint
+    ✓ security-check
+    ✓ unit-tests
+  
+  Result re-injection:
+    clone.commit-sha → abc123def456
+    build.image-digest → sha256:789abc...
+  
+    Warnings:
+    • Workspace 'source' PVC must still exist
+    • Task 'deploy' has side effects
+```
+
+---
+
+#### 11.4.2 Tekton Dashboard UI Flow
+
+**Note:** Dashboard calls the same controller endpoint (`POST /retry`) as the CLI.
+
+**Step 1: PipelineRun Detail Page**
+```
+╔══════════════════════════════════════════════════════════╗
+║ PipelineRun: pr-123                         Status: ❌ Failed ║
+╠══════════════════════════════════════════════════════════╣
+║                                                          ║
+║  [Logs] [YAML] [TaskRuns] [🔁 Retry Failed Tasks]      ║
+║                                                          ║
+╚══════════════════════════════════════════════════════════╝
+```
+
+**Step 2: Retry Plan Preview Modal**
+
+**User clicks [🔁 Retry Failed Tasks]** → Dashboard calls `POST /retry {"dryRun": true}` to fetch plan
+
+```
+╔═══════════════════════════════════════════════════════════╗
+║             Retry Failed Tasks - Preview                  ║
+╠═══════════════════════════════════════════════════════════╣
+║                                                           ║
+║  📊 Retry Plan:                                          ║
+║                                                           ║
+║  Re-run (3 tasks):          Reuse (5 tasks):            ║
+║    🔴 test                    🟢 clone                   ║
+║    ⚪ scan                    🟢 build                   ║
+║    ⚪ deploy                  🟢 lint                    ║
+║                              🟢 security-check          ║
+║                              🟢 unit-tests              ║
+║                                                           ║
+║  ⚠️  Warnings:                                           ║
+║    • Workspace 'source' will be reused (may be stale)   ║
+║    • Task 'deploy' has side effects                     ║
+║                                                           ║
+║  ☑️ I understand that retrying may duplicate side effects ║
+║                                                           ║
+║           [Cancel]  [Retry Failed Tasks]                ║
+╚═══════════════════════════════════════════════════════════╝
+```
+
+**User clicks [Retry Failed Tasks]** → Dashboard calls `POST /retry {"failedOnly": true}` to create retry PipelineRun
+
+**Step 3: Retry Execution View**
+```
+╔══════════════════════════════════════════════════════════╗
+║ PipelineRun: pr-123-retry-1            Status: 🔄 Running ║
+╠══════════════════════════════════════════════════════════╣
+║                                                          ║
+║  🔗 Retry of: pr-123                                     ║
+║  📅 Started: 2026-09-27 09:00:00                        ║
+║                                                          ║
+║  Tasks:                                                  ║
+║    🔵 clone (reused)         ✓ Succeeded                ║
+║    🔵 build (reused)         ✓ Succeeded                ║
+║    🟡 test (re-run)          🔄 Running...              ║
+║    ⚪ scan                   ⏸️ Pending                  ║
+║    ⚪ deploy                 ⏸️ Pending                  ║
+║                                                          ║
+╚══════════════════════════════════════════════════════════╝
+
+Legend:
+🔵 Blue = Reused from original run
+🟡 Yellow = Re-executed in retry
+```
+
+---
+
+#### 11.4.3 OpenShift Console Integration
+
+**Note:** Console calls the same controller endpoint (`POST /retry`) as CLI and Dashboard.
+
+**Actions Menu:**
+```
+╔══════════════════════════════════════════════╗
+║ PipelineRun Actions                          ║
+╠══════════════════════════════════════════════╣
+║  View Logs                                   ║
+║  View YAML                                   ║
+║  Delete PipelineRun                          ║
+║  ─────────────────────────────                ║
+║  🔁 Retry Failed Tasks                       ║
+║  🔄 Rerun Full Pipeline                      ║
+╚══════════════════════════════════════════════╝
+```
+
+**Topology View (showing retry relationship):**
+```
+  pr-123 (Failed)
+      ↓
+  pr-123-retry-1 (Running)
+      ↓
+  pr-123-retry-2 (if needed)
+```
+
+---
+
+### 11.5 Audit Trail Requirements
+
+#### 11.5.1 Kubernetes Events
+
+**Original PipelineRun:**
+```yaml
+apiVersion: v1
+kind: Event
+metadata:
+  name: pr-123.retry-initiated
+type: Normal
+reason: RetryInitiated
+message: "Retry PipelineRun 'pr-123-retry-1' created by user@example.com"
+involvedObject:
+  apiVersion: tekton.dev/v1
+  kind: PipelineRun
+  name: pr-123
+  uid: abc-123
+```
+
+**Retry PipelineRun:**
+```yaml
+apiVersion: v1
+kind: Event
+metadata:
+  name: pr-123-retry-1.retry-started
+type: Normal
+reason: RetryStarted
+message: "Retry of 'pr-123' started. Reusing 5 tasks, re-running 3 tasks."
+involvedObject:
+  apiVersion: tekton.dev/v1
+  kind: PipelineRun
+  name: pr-123-retry-1
+  uid: def-456
+```
+
+#### 11.5.2 Audit Log Entries
+
+**Required fields for compliance:**
+```json
+{
+  "timestamp": "2026-09-27T09:00:00Z",
+  "action": "retry",
+  "resource": {
+    "kind": "PipelineRun",
+    "namespace": "production",
+    "name": "pr-123",
+    "uid": "abc-123"
+  },
+  "actor": {
+    "user": "user@example.com",
+    "serviceAccount": "pipeline-runner",
+    "groups": ["developers", "sre"]
+  },
+  "result": "success",
+  "retryMetadata": {
+    "retryPipelineRun": "pr-123-retry-1",
+    "retryAttempt": 1,
+    "preservedTasks": ["clone", "build", "lint"],
+    "rerunTasks": ["test", "scan", "deploy"],
+    "reason": "user-initiated"
+  }
+}
+```
+
+#### 11.5.3 Lineage Query Support
+
+**Use case:** Security audit needs to trace all retries of a specific PipelineRun
+
+**Query pattern:**
+```bash
+# Find all retries of pr-123
+kubectl get pipelineruns \
+  -l tekton.dev/original-pipelinerun=pr-123 \
+  --sort-by=.metadata.creationTimestamp
+
+# Find original run from retry
+kubectl get pipelinerun pr-123-retry-2 \
+  -o jsonpath='{.metadata.annotations.tekton\.dev/retryOf}'
+```
+
+**Label requirements:**
+```yaml
+metadata:
+  labels:
+    tekton.dev/pipeline: my-pipeline
+    tekton.dev/original-pipelinerun: pr-123  # Enable lineage queries
+  annotations:
+    tekton.dev/retryOf: abc-123-def  # Original PR UID
+    tekton.dev/retryAttempt: "2"
+```
+
+---
+
+### 11.6 Recommended API Design (Final)
+
+**For v1: Option A (Controller Endpoint) - Aligned with Part 7**
+
+- **Primary API Shape:** **Controller endpoint** (Option A from Part 7)
+- **Orchestration:** Server-side calculation of failed subgraph and retry plan
+- **API endpoint:** `POST /apis/tekton.dev/v1/namespaces/{ns}/pipelineruns/{name}/retry`
+- **API fields in generated PipelineRun:** 
+  - `metadata.annotations` for lineage (`tekton.dev/retryOf`, `tekton.dev/retryAttempt`)
+  - `spec.retriedTaskResults` for memoized results (injected by controller)
+  - `status.retryMetadata` for provenance tracking
+- **CLI:** `tkn pipelinerun retry <name>` → calls API endpoint, with `--dry-run` support
+- **Dashboard:** Retry button → calls API endpoint, shows preview modal with warnings
+- **Console:** Actions menu → calls API endpoint, topology view shows retry lineage
+- **Security:** 
+  - Same-namespace only (enforced by controller)
+  - Require GET permission on original PR (enforced by admission webhook)
+  - Admission webhook validates retry metadata consistency
+  - Fine-grained RBAC: `pipelineruns/retry` subresource permission
+- **Provenance:** `status.retryMetadata` for Tekton Chains integration
+- **Audit:** Kubernetes Events + structured audit logs with user attribution
+
+**Rationale:** See Part 7.5 for complete decision analysis (performance, consistency, maintainability, security, UX).
+
+**Alternatives Evaluated but Not Chosen:**
+- **Option B** (client-side): See Part 7.3 and 7.5 for evaluation
+- **Option C** (annotation): Deferred to v2 for automation use cases
+
+**For v2+ consideration:**
+- **Option C** (annotation-based auto-retry) for fully automated CI/CD scenarios
+  - Requires: retry loop protection, side effect detection, safety policies
+  - Use case: Automatically retry failed pipelines without human intervention
+- Retry policies at Pipeline level (max attempts, backoff strategy)
+- Enhanced provenance with full task lineage graph
+- Cross-namespace retries (if strong use case emerges with proper security model)
+
+---
+
 ## Related Documents
 
 - **Architecture Research:** `research/architecture-analysis.md` (Parts 1-4)
