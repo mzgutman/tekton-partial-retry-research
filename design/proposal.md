@@ -100,7 +100,7 @@ graph LR
     
     subgraph finally
         cleanup[cleanup ✓]
-        notify[notify ✓]
+        notify[notify ✓]                              
     end
     
     style cleanup fill:#90EE90
@@ -213,9 +213,420 @@ graph LR
 
 
 
+
 ## Part 6 — Design: Result Re-injection (Memoization)
 
-*Status: In Progress - Story SRVKP-14275*
+Because the retry operation generates a new `PipelineRun` object, the stateless reconciler will not natively see the `TaskRun` objects from the original execution in its `ChildReferences`. To prevent downstream tasks from failing to resolve their `$(tasks.X.results.Y)` parameter expressions, the system must explicitly inject the preserved results into the new run.
+
+---
+
+### 6.1 The Result Injection Problem
+
+**Why injection is necessary:**
+
+When a partial retry creates a new `PipelineRun`, the Tekton reconciler starts with a clean slate:
+- `status.childReferences[]` is empty (no TaskRuns from original run)
+- Result references like `$(tasks.clone.results.commit-sha)` have no source to resolve from
+- Downstream tasks fail with `PipelineValidationFailed` (missing result references)
+
+**Example scenario:**
+```
+Original run:
+  clone (succeeded) → build (succeeded) → test (failed)
+  └─ results: commit-sha=abc123
+
+Retry run (WITHOUT result injection):
+  test re-runs → references $(tasks.clone.results.commit-sha)
+             → clone TaskRun doesn't exist in this PipelineRun
+             → ValidationFailed: result not found
+
+Retry run (WITH result injection):
+  test re-runs → references $(tasks.clone.results.commit-sha)
+             → ResolveResultRef finds "abc123" in spec.retriedTaskResults
+             → Result resolves successfully
+```
+
+**Design constraint:** Result injection must happen **at PipelineRun creation time** (not during reconciliation) to maintain stateless reconciler principle.
+
+---
+
+### 6.2 Injection Mechanism: Option A (New Spec Field)
+
+**Chosen approach:** Add new `spec.retriedTaskResults` field to PipelineRun CRD.
+
+**API structure:**
+```yaml
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: pr-123-retry-1
+  annotations:
+    tekton.dev/retryOf: "pr-123-uid-abc"
+spec:
+  pipelineRef:
+    name: my-pipeline
+  params: [...]
+  workspaces: [...]
+  
+  # NEW FIELD: Memoized results from bypassed tasks
+  retriedTaskResults:
+    - pipelineTaskName: clone
+      results:
+        - name: commit-sha
+          value: "abc123def456"
+        - name: repo-url
+          value: "https://github.com/org/repo"
+    - pipelineTaskName: build
+      results:
+        - name: image-digest
+          value: "sha256:789abc..."
+        - name: build-id
+          value: "12345"
+```
+
+**How it works:**
+1. Controller's `/retry` endpoint computes failed subgraph (Part 5 rules)
+2. Controller identifies bypassed tasks (successful tasks not in re-run set)
+3. Controller harvests results from bypassed tasks (see 6.3)
+4. Controller populates `spec.retriedTaskResults` when generating retry PipelineRun
+5. Modified `ResolveResultRef()` checks this field as secondary lookup tier (see 6.4)
+
+**Why a spec field (not status or annotations)?**
+- **Spec carries intent:** Results are input state for the retry execution
+- **Immutable after creation:** Results fixed at retry creation time (no drift)
+- **Validated by admission controller:** Can enforce security checks on injected values
+- **Clear semantics:** "This PipelineRun should resolve these results as if tasks ran"
+
+---
+
+### 6.3 Result Harvesting (Extraction Process)
+
+**Harvesting process:**
+
+**Priority order for extraction** (maximizes resilience to garbage collection):
+
+```go
+// Pseudocode for controller's retry endpoint
+func extractResultsForBypassedTasks(originalPR *PipelineRun, bypassedTasks []string) ([]RetriedTaskResult, error) {
+    retriedResults := []RetriedTaskResult{}
+    
+    for _, taskName := range bypassedTasks {
+        taskResults := []Result{}
+        
+        // Priority 1: Check PipelineRun.Status.Results[] (bubbled-up results)
+        // These survive TaskRun pruning (PipelineRuns live longer than TaskRuns)
+        for _, prResult := range originalPR.Status.Results {
+            if prResult.PipelineTaskName == taskName {
+                taskResults = append(taskResults, Result{
+                    Name:  prResult.Name,
+                    Value: prResult.Value,
+                })
+            }
+        }
+        
+        // Priority 2: Check TaskRun.Status.Results[] (direct from TaskRun)
+        if len(taskResults) == 0 {
+            taskRun := getTaskRun(originalPR, taskName)
+            if taskRun == nil {
+                return nil, fmt.Errorf(
+                    "cannot retry: TaskRun for task '%s' was pruned and results not bubbled up.\n" +
+                    "To enable retry after GC:\n" +
+                    "  1. Bubble up results to Pipeline level (declare Pipeline.spec.results), OR\n" +
+                    "  2. Install Tekton Results (Phase 2 feature)",
+                    taskName)
+            }
+            
+            for _, trResult := range taskRun.Status.Results {
+                taskResults = append(taskResults, Result{
+                    Name:  trResult.Name,
+                    Value: trResult.Value,
+                })
+            }
+        }
+        
+        // Priority 3: Query Tekton Results API (Phase 2, if enabled)
+        if len(taskResults) == 0 && isResultsEnabled() {
+            archivedResults, err := queryResultsAPI(originalPR.UID, taskName)
+            if err == nil {
+                taskResults = archivedResults
+            } else {
+                return nil, fmt.Errorf("cannot retry: results unavailable from etcd and Results API: %w", err)
+            }
+        }
+        
+        // Store harvested results
+        if len(taskResults) > 0 {
+            retriedResults = append(retriedResults, RetriedTaskResult{
+                PipelineTaskName: taskName,
+                Results:          taskResults,
+            })
+        }
+    }
+    
+    return retriedResults, nil
+}
+```
+
+**Harvesting priority rationale:**
+1. **Tier 1 first:** Bubbled-up results in `PipelineRun.Status.Results[]` survive TaskRun pruning (TTL: ~7 days vs. ~24 hours)
+2. **Tier 2 second:** Direct TaskRun results (only available if TaskRun not yet pruned)
+3. **Tier 3 last:** External Results API (Phase 2 feature, requires Results installation)
+
+**Error handling:** If all tiers fail, reject retry request immediately with actionable error message (fail-fast UX).
+
+---
+
+### 6.4 Modified ResolveResultRef Logic
+
+**Existing function:** `pkg/reconciler/pipelinerun/resources/resultrefresolution.go:ResolveResultRef()`
+
+**Updated implementation** (three-tier lookup):
+
+```go
+// ResolveResultRef resolves a result reference during PipelineRun reconciliation
+func ResolveResultRef(pr *PipelineRun, state PipelineRunState, ref *ResultRef) (string, error) {
+    taskName := ref.PipelineTask
+    resultName := ref.Result
+    
+    // Tier 1: Live state (task actually executed in THIS retry)
+    // Priority: Fresh execution always wins over memoized data
+    if rpt := state[taskName]; rpt != nil {
+        for _, tr := range rpt.TaskRuns {
+            if tr.IsSuccessful() {
+                for _, result := range tr.Status.Results {
+                    if result.Name == resultName {
+                        // Fresh result from current retry execution
+                        return result.Value.StringVal, nil
+                    }
+                }
+            }
+        }
+    }
+    
+    // Tier 2: Memoized state (from spec.retriedTaskResults)
+    // This tier provides results for bypassed tasks
+    if pr.Spec.RetriedTaskResults != nil {
+        for _, memoized := range pr.Spec.RetriedTaskResults {
+            if memoized.PipelineTaskName == taskName {
+                for _, result := range memoized.Results {
+                    if result.Name == resultName {
+                        // Memoized result from original run
+                        return result.Value.StringVal, nil
+                    }
+                }
+            }
+        }
+    }
+    
+    // Tier 3: Tekton Results API (Phase 2, optional)
+    // Fallback for pruned TaskRuns not memoized in spec
+    if isResultsEnabled() && pr.Annotations["tekton.dev/retryOf"] != "" {
+        originalPRUID := pr.Annotations["tekton.dev/retryOf"]
+        if value, err := queryResultsAPI(originalPRUID, taskName, resultName); err == nil {
+            // Archived result from Results API
+            return value, nil
+        }
+    }
+    
+    // All tiers failed - result not found
+    return "", &ResultNotFoundError{
+        PipelineTask: taskName,
+        ResultName:   resultName,
+        Reason:       "result not found in live state, memoized state, or Results API",
+    }
+}
+```
+
+**Key design principles:**
+- **Tier 1 always wins:** Prevents stale memoized data from overriding fresh execution
+- **Tier 2 for bypassed tasks:** Provides results for tasks not re-run in this retry
+- **Tier 3 for recovery:** Phase 2 feature to handle pruned TaskRuns after extended delays
+- **Fail explicitly:** Clear error if result unavailable (triggers `ValidationFailed` task status)
+
+**Reconciler integration:**
+- No changes to reconciler reconcile loop
+- `ResolveResultRef` called during parameter resolution (existing code path)
+- Failed result resolution → task status `ValidationFailed` → downstream tasks skipped (existing behavior)
+
+---
+
+### 6.5 Known Limitations & Edge Cases
+
+#### 6.5.1 Result Size Limits
+
+**Constraint:** Tekton enforces **4KB limit** per result value (etcd value size limit).
+
+**Impact on retry:**
+- Large results (> 4KB) cannot be memoized via `spec.retriedTaskResults`
+- Harvesting fails if bypassed task has oversized result
+
+**Error handling:**
+**Error:** Reject with clear message explaining 4KB limit and suggesting workspaces for large data.
+
+**Mitigation guidance (documentation):**
+- Results should store **metadata** only: commit SHAs, image digests, URLs, exit codes
+- Use **workspaces** for large data: build artifacts, logs, test reports
+
+---
+
+#### 6.5.2 Array and Object Results
+
+**Tekton v1 feature:** Results can be arrays or objects, not just strings.
+
+**Example:**
+```yaml
+results:
+  - name: test-failures
+    type: array
+    value: ["test1", "test2", "test3"]
+  - name: build-metadata
+    type: object
+    value:
+      commitSha: "abc123"
+      buildId: "12345"
+```
+
+**Implementation requirement:**
+- Store complex results as **JSON** in `spec.retriedTaskResults[].results[].value`
+- `ResolveResultRef` must **reconstruct correct type** when returning value
+
+**Pseudocode:**
+**Implementation:** Store complex results as JSON, preserve type metadata, reconstruct on resolution.
+
+---
+
+#### 6.5.3 Race Condition Window
+
+**Scenario:** TaskRun pruned between pre-flight validation and PipelineRun creation.
+
+**Timeline:**
+```
+t=0   Controller validates: TaskRun exists ✓
+t=1   Kubernetes TTL controller prunes TaskRun (background job)
+t=2   Controller tries to harvest results → TaskRun not found ✗
+```
+
+**Mitigation:**
+- **Atomic operation:** Validation and PipelineRun creation happen in **same HTTP request** (controller `/retry` endpoint)
+- **Time window minimized:** Milliseconds (single reconcile operation vs. distributed client calls)
+- **Fail gracefully:** If TaskRun disappears mid-request, return clear error (user can retry the retry request)
+
+**Why controller-side wins:** Client-side approach (Option B from Part 7) has **minutes-long** race window (user validates → thinks about it → triggers retry).
+
+---
+
+#### 6.5.4 Manual TaskRun Deletion
+
+**Scenario:** User/operator manually deletes a succeeded TaskRun before retry.
+
+**Detection:**
+- Pre-flight validation detects missing TaskRun
+- Checks if result was bubbled up to `PipelineRun.Status.Results[]`
+- If not bubbled: reject retry with error
+
+**Error message:**
+```
+Cannot retry: TaskRun 'pr-123-clone' was deleted. Result data lost.
+
+Partial retry after manual TaskRun deletion is not supported. Options:
+  1. Full re-run (tkn pipelinerun start --from-pipelinerun pr-123), OR
+  2. Install Tekton Results for long-term result storage (Phase 2)
+```
+
+**Why unsupported:** Manual deletion is an operator action outside normal Tekton lifecycle. System cannot guarantee data availability.
+
+---
+
+### 6.6 Alternative Approaches Considered
+
+#### Option B: Synthetic TaskRuns (Rejected)
+
+**Concept:** Create "ghost" TaskRuns with pre-populated `status.results[]` but no actual Pod.
+
+**How it would work:**
+1. Controller generates retry PipelineRun (normal)
+2. Controller pre-creates TaskRuns for bypassed tasks with:
+   - `status.conditions: [{type: Succeeded, status: True}]`
+   - `status.results: [{name: commit-sha, value: abc123}]`
+   - `metadata.annotations: {tekton.dev/synthetic: "true"}`
+3. Controller adds synthetic TaskRuns to `status.childReferences[]`
+4. Reconciler sees them as normal TaskRuns, resolves results normally
+
+**Why rejected:**
+-  **Violates TaskRun lifecycle:** TaskRuns without Pods break core Tekton assumption (every TaskRun has 1:1 Pod)
+-  **Confuses provenance:** Chains sees TaskRuns but finds no Pod attestations (SLSA verification fails)
+-  **Complex ownership:** Who owns synthetic TaskRuns? PipelineRun controller can't create TaskRuns directly (TaskRun controller does)
+-  **Reconciler confusion:** Special-case logic needed: "if synthetic TaskRun, don't try to create Pod"
+-  **Garbage collection:** When to delete synthetic TaskRuns? PipelineRun completion? But they're not "real" children.
+
+---
+
+#### Option C: Retry-Specific Reconciler Logic (Rejected)
+
+**Concept:** Add "retry mode" flag to PipelineRun. Reconciler loads results from original run on-demand.
+
+**How it would work:**
+1. Retry PipelineRun has annotation: `tekton.dev/retry-mode: "true"`
+2. During result resolution, reconciler checks annotation
+3. If retry mode: query original PipelineRun's TaskRuns for results
+4. Cache results in-memory for duration of reconcile loop
+
+**Why rejected:**
+-  **Violates stateless reconciler principle:** Reconciler depends on external state (original PipelineRun/TaskRuns)
+-  **Tight coupling:** Retry logic embedded in core reconciler (harder to maintain)
+-  **Performance:** Every result resolution triggers K8s API query to original run
+-  **Complex testing:** Reconciler behavior depends on whether original run exists, TaskRuns pruned, etc.
+-  **Hidden state:** Retry PipelineRun YAML doesn't show what results are being reused (bad observability)
+
+---
+
+#### Why Option A (Spec Field) Wins
+
+ **Clean separation:** Spec carries state, reconciler stays stateless 
+ **Explicit:** Retry PipelineRun YAML shows exactly what results are memoized (full transparency) 
+ **Auditable:** Users/tools can inspect `spec.retriedTaskResults` to see what was reused 
+ **Simple:** Minimal changes (just `ResolveResultRef` function, no reconciler changes) 
+ **Testable:** Inject spec field in unit tests, verify result resolution (no need for complex original run setup) 
+ **Secure:** Admission controller can validate injected results (prevent injection attacks)
+
+---
+
+### 6.7 CRD API Changes Required
+
+**New field in `PipelineRunSpec`:**
+
+```go
+// pkg/apis/pipeline/v1/pipelinerun_types.go
+
+type PipelineRunSpec struct {
+    // ... existing fields ...
+    
+    // RetriedTaskResults holds memoized results from bypassed tasks in a partial retry.
+    // This field is populated by the controller when generating a retry PipelineRun.
+    // Results here take precedence over missing TaskRuns for bypassed tasks.
+    // +optional
+    RetriedTaskResults []RetriedTaskResult `json:"retriedTaskResults,omitempty"`
+}
+
+type RetriedTaskResult struct {
+    // PipelineTaskName is the name of the task in the Pipeline
+    PipelineTaskName string `json:"pipelineTaskName"`
+    
+    // Results are the result values from the original execution
+    Results []TaskRunResult `json:"results"`
+}
+```
+
+**Validation (admission webhook):**
+```yaml
+if spec.retriedTaskResults exists:
+  - Require annotation tekton.dev/retryOf (must reference original PipelineRun)
+  - Validate pipelineTaskNames match Pipeline spec
+  - Validate result names match Task definitions
+  - Enforce 4KB limit per result value
+  - Reject if results contain suspicious patterns (injection attack detection)
+```
+
 
 ---
 
@@ -295,7 +706,8 @@ When a user requests a retry, **who calculates which tasks to re-run**? Two fund
 | **CircleCI** | ✗ No (SaaS) | Server-side | API-driven retry |
 | **Jenkins** | ✗ No (pre-K8s) | Server-side | Master (controller) handles restart-from-stage |
 
-**Key insight:** The only Kubernetes-native system (Argo) uses **client-side orchestration**. SaaS systems use server-side, but they're not constrained by CRD immutability or K8s declarative patterns.
+
+**Key insight:** The only K8s-native system (Argo) uses client-side orchestration. SaaS systems use server-side but aren't constrained by K8s patterns.
 
 ---
 
@@ -563,7 +975,520 @@ WARNING: Partial retry will re-execute failed tasks and reuse existing workspace
 ```
 
 ---
-## Part 9 — Design Evaluation: Pipeline Definition Stability - TO DO
+
+## Part 9 — Design Evaluation: Pipeline Definition Stability
+
+When a PipelineRun references remote resources (Tasks or Pipelines resolved from Git repositories or OCI registries), those resources may change between the original run and a retry. This section evaluates strategies to ensure retry executions use the **same definitions** as the original run, maintaining reproducibility and compliance requirements.
+
+---
+
+### 9.1 The Resolution Drift Problem
+
+**Core challenge:** Remote references are often **mutable** (Git branches, OCI tags) and can point to different content over time.
+
+**Scenario:**
+```yaml
+# Day 1: User creates PipelineRun
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+spec:
+  pipelineRef:
+    resolver: git
+    params:
+      - name: url
+        value: https://github.com/org/tasks
+      - name: revision
+        value: main  # Mutable reference
+      - name: pathInRepo
+        value: task.yaml
+
+# Day 1: Resolves to commit abc123def456...
+# Pipeline runs, task fails
+
+# Day 2: Developer pushes bug fix to main
+# main now points to commit 789abc123...
+
+# Day 3: User retries pipeline
+# Question: Should retry use abc123 (original) or 789abc (latest)?
+```
+
+**Industry standard:** Use **same commit** as original run (abc123, not 789abc).
+
+**Why reproducibility matters:**
+1. **Compliance & Auditing:** Security audits must prove exactly what code executed
+2. **Debugging:** If retry succeeds after original failed, need to know if it's the same code or different fix
+3. **SLSA Provenance:** Attestations must link to immutable artifact sources (commit SHAs, OCI digests)
+4. **Determinism:** Retry should test whether the failure was transient, not whether the new code works
+
+---
+
+#### 9.1.1 Mutable vs. Immutable References
+
+**Git references:**
+- **Mutable:** Branches (`main`, `feature/x`), tags (`v1.0.0` can be moved)
+- **Immutable:** Commit SHAs (`abc123def456...`)
+
+**OCI references:**
+- **Mutable:** Tags (`latest`, `v1.0`)
+- **Immutable:** Digests (`sha256:abc123...`)
+
+**Tekton behavior today:**
+- User specifies mutable ref → Remote resolver queries upstream → Resolves to immutable ref (SHA/digest)
+- Original resolved SHA **is recorded** in `ResolutionRequest.Status.Data` (but not stored long-term in PipelineRun)
+
+**Retry requirement:** Must preserve and reuse the original resolved SHA/digest, not re-resolve mutable ref.
+
+---
+
+#### 9.1.2 Multi-Level Resolution Problem
+
+**Complexity:** Pipelines can reference Tasks, which themselves reference other remotes. **Both levels must be pinned.**
+
+**Example:**
+```yaml
+# Level 1: Pipeline resolved from Git
+pipelineRef:
+  resolver: git
+  params:
+    - name: url
+      value: https://github.com/org/pipelines
+    - name: revision
+      value: main  # → Resolves to commit abc123 at Day 1
+    - name: pathInRepo
+      value: ci-pipeline.yaml
+
+# Level 2: Within that Pipeline, tasks reference OCI bundles
+# (from resolved ci-pipeline.yaml)
+apiVersion: tekton.dev/v1
+kind: Pipeline
+spec:
+  tasks:
+    - name: build
+      taskRef:
+        resolver: bundles
+        params:
+          - name: bundle
+            value: gcr.io/org/tasks:latest  # → Resolves to sha256:def456 at Day 1
+```
+
+**Challenge:** If we only pin the Pipeline SHA (abc123), the nested Task ref (`latest`) can still drift to sha256:xyz789.
+
+**Required:** Recursively pin both Pipeline definition (Level 1) AND all nested Task references (Level 2).
+
+**How each option handles multi-level resolution:**
+- **Option A (Status Snapshot):** Resolved Pipeline status already includes fully-resolved nested Task specs (recursive inlining) ✓
+- **Option B (SHA Pinning):** Must recursively track and pin Pipeline SHA + all Task SHAs (complex implementation) 
+- **Option C (Hybrid):** Inline specs automatically include resolved Tasks (recursive by design) ✓
+- **Option D (Validate-Only):** Either level drifting causes failure (brittle) ✗
+
+---
+
+### 9.2 Strategy Evaluation for Definition Stability
+
+Four approaches exist to ensure retry uses original definitions. Each trades off **storage size**, **provenance traceability**, and **resilience to remote failures**.
+
+---
+
+#### Option A: Extract from Inlined Specs (Status Snapshot)
+
+**How it works today:**
+
+When Tekton resolves a remote resource, the reconciler **stores the full resolved spec** in the run object's status:
+- `TaskRun.Status.TaskSpec` (resolved Task definition, ~1-10KB)
+- `PipelineRun.Status.PipelineSpec` (resolved Pipeline definition with inlined Tasks, ~10-100KB)
+
+**For retry:**
+1. Read `PipelineRun.Status.PipelineSpec` from original run
+2. Copy entire spec into retry `PipelineRun.Spec.PipelineSpec` (inline)
+3. Retry uses inline spec (no re-resolution needed)
+
+**Example:**
+```yaml
+# Original run (after resolution)
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: pr-123
+spec:
+  pipelineRef:  # User provided this
+    resolver: git
+    params: [...]
+status:
+  pipelineSpec:  # Controller stored resolved spec here
+    tasks:
+      - name: build
+        taskSpec:  # Resolved Task fully inlined
+          steps:
+            - name: compile
+              image: golang:1.21
+              script: go build ./...
+
+---
+
+# Retry run (generated by controller)
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: pr-123-retry-1
+spec:
+  pipelineSpec:  # Copied from original.status.pipelineSpec
+    tasks:
+      - name: build
+        taskSpec:
+          steps:
+            - name: compile
+              image: golang:1.21
+              script: go build ./...
+```
+
+**Pros:**
+- **Always available:** Resolved spec already stored in original run's status
+- **Exact copy:** Guarantees byte-for-byte identical definition
+- **No re-resolution needed:** Fast retry creation (~10ms vs. ~500ms for remote query)
+- **Works if remote deleted:** Git repo made private, OCI registry deleted → retry still works
+- **Handles multi-level resolution:** Nested Task specs already fully inlined recursively
+- **No credential issues:** Doesn't need imagePullSecrets or Git tokens to retry
+
+**Cons:**
+-  **Large status size:** Full YAML embedded in status (10-100KB for complex Pipelines)
+-  **Loses provenance metadata:** Resolved spec doesn't include original Git commit SHA or OCI digest
+-  **Audit/security limitation:** Cannot trace back to immutable source artifact for compliance
+-  **Bloats etcd:** Every PipelineRun status grows by 10-100KB
+
+---
+
+#### Option B: Store ResolutionRequest Content Hash (SHA Pinning)
+
+**How it would work:**
+
+1. **At original run creation:** Store hash of resolved content + remote ref metadata in annotations
+2. **At retry time:** Re-resolve using remote resolver, validate that resolved content matches stored hash
+
+**Annotations to add:**
+```yaml
+metadata:
+  annotations:
+    tekton.dev/resolved-content-sha256: "abc123..."  # Hash of resolved spec
+    tekton.dev/resolver-type: "git"
+    tekton.dev/resolver-url: "https://github.com/org/tasks"
+    tekton.dev/resolver-revision: "abc123def456..."  # Git commit SHA or OCI digest
+    tekton.dev/resolver-path: "task.yaml"
+```
+
+**For retry:**
+1. Read annotations from original run
+2. Call remote resolver with **pinned SHA** (not mutable ref)
+3. Validate resolved content hash matches stored hash
+4. Use resolved spec if validation succeeds
+
+**Pros:**
+-  **Small footprint:** Just hash + metadata (~100 bytes vs. 10-100KB)
+-  **Perfectly preserves provenance:** Original Git commit SHA / OCI digest stored
+-  **Audit/compliance ready:** Provenance tools can verify immutable source artifact
+-  **Can detect drift:** If resolved content doesn't match hash, fail with clear error
+
+**Cons:**
+-  **Requires re-resolution:** Must query remote resolver at retry time (100-500ms latency)
+-  **Fails if remote unavailable:** Git repo deleted, OCI registry down, auth expired → retry blocked
+-  **Doesn't work for cluster-local Tasks:** No `ResolutionRequest` for in-cluster resources
+-  **Complex for multi-level resolution:** Must recursively pin Pipeline SHA + all nested Task SHAs/digests
+-  **Network dependency:** Retry creation blocked if network partition from Git/OCI registry
+
+---
+
+#### Option C: Hybrid Approach (Inline Specs + Provenance Annotations)
+
+**How it works:**
+
+Combine Option A (inline specs) with Option B (provenance metadata) to get both execution stability AND provenance traceability.
+
+**For retry:**
+1. Copy `PipelineRun.Status.PipelineSpec` → `PipelineRun.Spec.PipelineSpec` (inline, guarantees execution)
+2. Extract original remote ref metadata (Git SHA, OCI digest) from `ResolutionRequest` objects
+3. Add provenance annotations for audit/security tools
+
+**Example:**
+```yaml
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: pr-123-retry-1
+  annotations:
+    tekton.dev/retryOf: "pr-123-uid"
+    # Provenance annotations (NEW)
+    tekton.dev/original-pipeline-resolver: "git"
+    tekton.dev/original-pipeline-url: "https://github.com/org/pipelines"
+    tekton.dev/original-pipeline-revision: "abc123def456..."  # Git commit SHA
+    tekton.dev/original-pipeline-path: "ci-pipeline.yaml"
+spec:
+  # Inline spec guarantees exact definition (NO re-resolution)
+  pipelineSpec:
+    tasks:
+      - name: build
+        taskSpec:
+          steps:
+            - name: compile
+              image: golang:1.21
+              script: go build ./...
+```
+
+**How provenance annotations are used in v1:**
+1. **Audit/debugging** → Admins can reconstruct the original Git commit SHA or OCI digest from annotations
+2. **Manual verification** → Security teams can compare stored SHAs against Git history for manual audits
+3. **Documentation** → Provides traceability for compliance without external dependencies
+
+**v2 enhancement (Chains integration):** See Part 9.8 for full Chains integration plan.
+
+**Benefit:** Retry execution immune to remote availability, provenance preserved for audit (v1) and future SLSA attestation (v2).
+
+**Pros:**
+-  **Guarantees exact definition:** Inline spec ensures byte-for-byte identical code
+-  **No re-resolution needed:** Fast retry creation, no remote queries
+-  **Works if remote deleted:** Git repo/OCI registry unavailable → retry still works
+-  **Preserves provenance:** Annotations provide Git SHA / OCI digest for audit tools
+-  **Handles multi-level resolution:** Nested Task specs already inlined recursively
+-  **Audit/compliance ready:** Provenance tools can reconstruct immutable source references
+-  **No credential issues:** Doesn't need active imagePullSecrets or Git tokens
+
+**Cons:**
+-  **Very large spec:** Retry PipelineRun objects can be 10-100KB (inline YAML + annotations)
+-  **Not fully declarative:** Retry YAML can't be reconstructed by hand from original `pipelineRef` alone
+-  **etcd bloat:** Retry PipelineRun specs much larger than normal runs
+
+**Mitigation for spec size:**
+- Modern etcd handles 10-100KB values easily (default limit: 1.5MB)
+- Inline `pipelineSpec` already common in Tekton (many users don't use remote resolution)
+- Retry PipelineRuns are derived objects (less frequent than normal runs)
+- Storage is cheaper than operational failures (remote outages blocking retries)
+
+---
+
+#### Option D: Validation-Only (Detect Drift, Fail Fast)
+
+**How it would work:**
+
+1. Copy original `pipelineRef` exactly as written (mutable refs like `main`, `latest`)
+2. At retry time, re-resolve mutable ref
+3. Compare resolved SHA against original run's resolved SHA
+4. If different → reject retry with error
+
+**Example error:**
+```
+Cannot retry: Pipeline definition changed since original run.
+  Original: commit abc123def456...
+  Current:  commit 789abc123...
+  
+  To retry, either:
+    1. Revert upstream changes to abc123, OR
+    2. Manually create retry PipelineRun with inline pipelineSpec
+```
+
+**Pros:**
+-  **Zero spec bloat:** No new fields, no annotations
+-  **Simple implementation:** Just SHA comparison logic
+
+**Cons:**
+-  **Unacceptably brittle:** Most delayed retries would fail (developers constantly push to `main`)
+-  **Poor UX:** Retry fails hours/days after original with cryptic "definition changed" error
+-  **Doesn't solve problem:** Only detects drift, doesn't enable retry
+-  **Blocks legitimate retries:** Even if new code is fine, user forced to revert or manual workaround
+
+**Verdict:** Not viable for production use (fails the "does this solve the user's problem?" test).
+
+---
+
+### 9.2.1 Evaluation Matrix    
+
+| Criterion | Option A (Status Snapshot) | Option B (SHA Pinning) | Option C (Hybrid) | Option D (Validate-Only) |
+|-----------|---------------------------|------------------------|-------------------|-------------------------|
+| **Guarantees Exact Definition** | ✓ Yes | ⊘ Yes (if remote available) | ✓ Yes | ✗ No (fails if changed) |
+| **Works if Remote Deleted** | ✓ Yes | ✗ No (resolution fails) | ✓ Yes | ✗ No |
+| **Preserves Provenance** | ✗ No (loses Git SHA) | v Yes | ✓ Yes (via annotations) | ✓ Yes (but brittle) |
+| **Spec Size Impact** | ⊘ Large (status bloat) | ✓ Small (just hash) | ✗ Very Large (inline YAML) | ✓ None |
+| **Re-resolution Required** | ✓ No | ✗ Yes | ✓ No | ✗ Yes |
+| **Resilience to Outages** | ✓ High | ✗ Low | ✓ High | ✗ Low |
+| **Preserves Provenance Metadata** | ✗ No (loses Git SHA) | ✓ Yes | ✓ Yes (via annotations) | ✓ Yes (but brittle) |
+| **Handles Multi-Level Resolution** | ✓ Yes (automatic) | ⊘ Yes (complex) | ✓ Yes (automatic) | ✗ No (brittle at each level) |
+| **Network Independence** | ✓ Yes | ✗ No | ✓ Yes | ✗ No |
+
+**Winner: Option C (5 ✓ / 1 ✗ / 2 ⊘)** — Best balance of execution stability, provenance preservation, and operational resilience.
+
+---
+
+### 9.3 Recommended Approach: Option C (Hybrid)
+
+**For v1: Inline resolved specs + provenance annotations**
+
+**Rationale:**
+
+1. **Execution guarantee:** Retry uses exact same code as original (immune to upstream drift, deletion, outages)
+2. **Provenance guarantee:** Annotations preserve immutable source references (Git commit SHA, OCI digest) for audit/security tools (v1) and future Chains integration (v2)
+3. **Operational resilience:** Works even if Git repo made private, OCI registry down, credentials expired
+4. **Debugging clarity:** Engineers can inspect inline spec to see exactly what code ran
+
+**Implementation:**
+
+**Implementation:**
+
+**Step 1: At retry-request time** (controller `/retry` endpoint)
+1. Extract resolved spec from `originalPR.Status.PipelineSpec`
+2. Extract provenance metadata from `ResolutionRequest` objects (Git SHA, OCI digest)
+3. Generate retry PipelineRun with:
+   - Inline `pipelineSpec` (guarantees exact definition)
+   - Provenance annotations (Git commit SHA / OCI digest)
+   - Copy original params, workspaces
+
+**Step 2: Provenance tools** (v1: audit/debugging, v2: Chains integration)
+- Annotations enable manual verification against Git history
+- Future Chains integration reads annotations for SLSA attestation (see Part 9.8)
+
+**Result:** Retry execution stable, provenance metadata preserved, no remote dependencies.
+
+**Result:** Retry execution stable, provenance metadata preserved for audit/debugging, no remote dependencies.
+
+**Note:** Provenance annotations serve immediate audit and compliance needs in v1 (see Section 9.3.1). Tekton Chains integration is planned for v2 (see Section 9.8).
+
+---
+
+### 9.3.1 Provenance Strategy for v1 (Chains-Independent)
+
+**Design principle:** Provenance annotations serve **immediate audit and debugging needs** in v1, independent of Chains.
+
+**Use cases without Chains:**
+
+1. **Security Audit:** Operators can trace retry executions back to exact Git commit
+   ```bash
+   kubectl get pr pr-123-retry-1 -o yaml | grep original-pipeline-revision
+   # Output: abc123def456... (immutable Git SHA)
+   ```
+
+2. **Debugging:** Engineers can verify which code version ran
+   ```bash
+   # Did retry use same code as original?
+   ORIG_SHA=$(kubectl get pr pr-123 -o jsonpath='{.status.pipelineSpec...}')
+   RETRY_SHA=$(kubectl get pr pr-123-retry-1 -o jsonpath='{.spec.pipelineSpec...}')
+   echo "Match: $([ "$ORIG_SHA" = "$RETRY_SHA" ] && echo 'yes' || echo 'no')"
+   ```
+
+3. **Compliance:** Immutable source references satisfy regulatory requirements
+   - PCI-DSS: "Track and monitor all access to system components"
+   - SOC 2: "Document changes to system configurations"
+   - GDPR: "Maintain records of processing activities"
+
+4. **Incident Response:** Link failed builds to specific code changes
+   ```
+   pr-123 failed → annotations show commit abc123
+   Developer investigates: git show abc123
+   Finds bug introduced in that commit
+   ```
+
+**Chains integration (v2):** These annotations will enable Tekton Chains to generate SLSA provenance attestations, but this is **not required** for v1 functionality.
+
+---
+
+### 9.4 Edge Cases
+
+**Edge Case 1: Remote Source Deleted**
+- **Option A/C:** ✓ Works (spec captured in status)
+- **Option B/D:** ✗ Fails (cannot re-resolve)
+
+**Edge Case 2: OCI Registry Credentials Expired**
+- **Option A/C:** ✓ Works (no re-resolution needed)
+- **Option B/D:** ✗ Fails (401 Unauthorized)
+
+**Edge Case 3: Pipeline Changed (Breaking)**
+- **All Options:** Retry uses original definition (ignores breaking change)
+- **Correct behavior:** Tests transient failure, not new code
+
+**Edge Case 4: CustomRun External Controller**
+- **v1:** Documented as unsupported (external controller manages own stability)
+- **Mitigation:** CustomRun controller implements similar strategy
+
+**Edge Case 5: Nested PipelineRun**
+- **v1:** Treat as atomic unit (parent pins, child can drift)
+- **Limitation:** Acceptable for v1, enhance in v2 if needed
+
+**Edge Case 6: Git Force-Push**
+- **All Options:** Cannot detect (violates Git integrity model)
+- **Verdict:** Accept as operational risk (outside Tekton control)
+
+---
+
+### 9.5 CRD API Changes Required
+
+**Good news:** No changes to PipelineRun CRD spec fields.
+
+Uses existing `spec.pipelineSpec` field (inline Pipeline definition, already supported).
+
+**New annotations** (metadata only):
+- `tekton.dev/retryOf` - Original PipelineRun UID for lineage tracking
+- `tekton.dev/original-pipeline-*` - Provenance metadata (resolver type, URL, revision/SHA, path)
+  - **Full annotation schema:** See Part 9.3 example for complete list
+
+**Controller implementation:**
+- Add provenance extraction logic to `/retry` endpoint
+- Query `ResolutionRequest` objects from original run (contain resolved Git SHA / OCI digest)
+- Copy `PipelineRun.Status.PipelineSpec` → `PipelineRun.Spec.PipelineSpec`
+- Populate provenance annotations
+
+**Validation (admission webhook):**
+- Verify format (Git SHA: 40 hex chars, OCI digest: sha256:64 hex chars)
+- Reject if malformed
+
+---
+
+### 9.6 Trade-offs Accepted
+
+#### Trade-off 1: Spec Bloat
+
+**Reality:** Retry PipelineRun objects will be **10-100KB** (vs. ~1KB for normal runs with `pipelineRef`).
+
+**Mitigation:**
+- etcd default value limit: **1.5MB** (plenty of headroom)
+- Inline `pipelineSpec` already common (many users don't use remote resolution)
+- Retry PipelineRuns are derived objects (less frequent than normal runs)
+- Storage is cheaper than operational failures (remote outages blocking retries)
+
+**Measurement:** For a typical CI pipeline (10 tasks, each ~1KB Task spec) → ~10KB inline spec → **0.67% of etcd limit**
+
+---
+
+#### Trade-off 2: Not Fully Declarative
+
+**Reality:** Retry PipelineRun YAML cannot be reconstructed by hand from original `pipelineRef` alone (requires original run's status as input).
+
+**Mitigation:**
+- This is **acceptable** — retry is a **derived object**, not a primary authored resource
+- Users don't hand-write retry PipelineRuns (generated by controller `/retry` endpoint or `tkn` CLI)
+- Transparency: Users can inspect generated YAML (kubectl get -o yaml) to see exactly what will run
+
+**Analogy:** Similar to how Kubernetes StatefulSet creates Pods — users don't hand-write Pod YAML, they inspect generated Pods.
+
+---
+
+### 9.7 Future Work: v2+ Enhancements
+
+**Tekton Chains Integration (Phase 2)**
+
+The provenance annotations added in v1 prepare the groundwork for Tekton Chains integration. Chains can use these annotations to generate SLSA provenance attestations that distinguish retry executions.
+
+**How Chains would use retry annotations (v2):**
+- Detect retry via `tekton.dev/retryOf` annotation
+- Read provenance (Git SHA, URL) from annotations
+- Generate SLSA attestation linking to immutable source
+- Distinguish inherited vs. fresh execution
+
+**v2 implementation tasks:**
+- Update Chains to read retry annotations for SLSA attestation
+- Generate attestations distinguishing inherited vs. fresh execution (see Part 11.3)
+- Document retry provenance contract for supply chain security
+
+**Why defer to v2:** 
+- Chains integration requires coordination with tektoncd/chains repository
+- Retry functionality provides immediate value without Chains (audit, debugging, compliance)
+- Provenance annotations in v1 are "Chains-ready" — no breaking changes needed for v2
+- Similar pattern to Tekton Results integration (Phase 1 = independent, Phase 2 = optional integration)
+
 
 ---
 
@@ -749,41 +1674,12 @@ Validate data availability before retry, fail with clear guidance.
 ---
 ### 10.5 Three-Tier Lookup Implementation (Phase 2)
 
-When a retry PipelineRun needs to resolve a result reference from a bypassed task, the controller performs a **three-tier lookup**:
+**Implementation details:** See Part 6.4 for the complete `ResolveResultRef()` three-tier lookup implementation (live state → memoized → Results API).
 
-```go
-ResolveResultRef(pipelineRunState, resultRef) (string, error) {
-    taskName := resultRef.PipelineTask
-    resultName := resultRef.Result
-    
-    // Tier 1: Live state (task actually ran in this retry)
-    if task := pipelineRunState[taskName]; task != nil && task.TaskRun != nil {
-        if result := task.TaskRun.Status.Results[resultName]; result != "" {
-            return result, nil  // Fresh result from this retry
-        }
-    }
-    
-    // Tier 2: Memoized state (bubbled-up results from original PR)
-    if pr.Spec.RetriedTaskResults[taskName][resultName] != "" {
-        return pr.Spec.RetriedTaskResults[taskName][resultName], nil
-    }
-    
-    // Tier 3: Tekton Results API (Phase 2, if enabled)
-    if resultsEnabled && originalPR.Annotations["tekton.dev/original-pr-uid"] != "" {
-        if result, err := queryResultsAPI(originalPR.UID, taskName, resultName); err == nil {
-            return result, nil
-        }
-    }
-    
-    // All tiers failed
-    return "", ErrResultNotFound  // Triggers ValidationFailedTask
-}
-```
-
-**Tier Priority Rationale:**
-1. **Tier 1 first:** Fresh execution in current retry always wins (prevents stale data)
-2. **Tier 2 second:** Bubbled-up results survive pruning, faster than API call
-3. **Tier 3 last:** External API query (latency cost, requires network/auth)
+**Key points for Phase 2:**
+- Tier 3 (Results API) query adds 50-200ms latency per result
+- Controller should cache Results API responses per reconcile loop
+- Feature flag: `tekton.dev/enable-results-fallback=true` (default: false for v1)
 
 ---
 
@@ -816,39 +1712,22 @@ spec:
 
 ### 10.7 Results API Query Implementation (Phase 2)
 
-**Query pattern:**
-```go
-func queryResultsAPI(originalPRUID, taskName, resultName string) (string, error) {
-    // Construct Results API query
-    client := resultsClient()
-    record, err := client.GetRecord(context.Background(), &pb.GetRecordRequest{
-        Name: fmt.Sprintf("default/results/%s/records/%s-%s", originalPRUID, originalPRUID, taskName),
-    })
-    if err != nil {
-        return "", fmt.Errorf("Results API unavailable: %w", err)
-    }
-    
-    // Extract result from TaskRun record
-    taskRun := &v1.TaskRun{}
-    if err := proto.Unmarshal(record.Data.Value, taskRun); err != nil {
-        return "", err
-    }
-    
-    for _, result := range taskRun.Status.Results {
-        if result.Name == resultName {
-            return result.Value.StringVal, nil
-        }
-    }
-    
-    return "", fmt.Errorf("result %s not found in archived TaskRun", resultName)
-}
-```
+**Query flow:**
+1. Construct Results API client (gRPC)
+2. Query record: `default/results/{originalPRUID}/records/{originalPRUID}-{taskName}`
+3. Unmarshal TaskRun from protobuf
+4. Extract result by name
 
-**Considerations:**
-- **Authentication:** Results API requires gRPC client credentials
-- **Latency:** External API call adds 50-200ms per result lookup
-- **Caching:** Controller should cache Results API responses per reconcile loop
-- **Feature flag:** `tekton.dev/enable-results-fallback=true` (default: false for v1)
+**Key considerations:**
+- **Authentication:** Requires gRPC client credentials
+- **Latency:** 50-200ms per result lookup
+- **Caching:** Cache responses per reconcile loop
+- **Feature flag:** `tekton.dev/enable-results-fallback=true`
+
+**Error handling:** Return clear errors if Results API unavailable or result not found in archived TaskRun.
+
+---
+
 
 ---
 
@@ -857,11 +1736,7 @@ func queryResultsAPI(originalPRUID, taskName, resultName string) (string, error)
 
 ### 11.1 API Shape (Aligned with Part 7 Recommendation)
 
-**Decision from Part 7:** Controller/API calculates (Option A - server-side orchestration)
-
-**Rationale:** See Part 7.5 for complete evaluation. Summary: Option A chosen for performance (4× efficiency), consistency across clients, single implementation, and better audit trail.
-
-This section details the API design, security model, and provenance tracking for the controller-side approach.
+**Decision from Part 7:** Server-side orchestration (see Part 7.5 for full rationale: 4× efficiency, consistency, audit trail).
 
 ---
 
