@@ -182,7 +182,7 @@ graph LR
 - **Behavior:** Finally tasks run after DAG completion; retrying them in isolation is ambiguous
 - **Action:** For v1, **reject** the retry request with error: "Cannot retry: only finally tasks failed. 
   Finally-only retry requires manual intervention or full pipeline rerun."
-- **Future Work:** Phase 2 could support finally-only retry with explicit user confirmation
+- **Future Work:** Finally-only retry deferred to Phase 2
 
 **Edge Case 3: Mixed error policies (stopAndFail + continue)**
 - **Subgraph:** Compute independently per branch
@@ -209,7 +209,7 @@ graph LR
 - **Subgraph:** Treats child PipelineRun as atomic (Rule 8)
 - **Behavior:** Entire child pipeline re-runs; does not compute subgraph within nested DAG
 - **Action:** For v1, accept this limitation. Warn user that nested pipelines retry fully.
-- **Future Work:** Recursive subgraph computation for nested pipelines
+- **Future Work:** Nested pipeline partial retry deferred to Phase 2
 
 
 
@@ -344,15 +344,10 @@ func extractResultsForBypassedTasks(originalPR *PipelineRun, bypassedTasks []str
             }
         }
         
-        // Priority 3: Query Tekton Results API (Phase 2, if enabled)
-        if len(taskResults) == 0 && isResultsEnabled() {
-            archivedResults, err := queryResultsAPI(originalPR.UID, taskName)
-            if err == nil {
-                taskResults = archivedResults
-            } else {
-                return nil, fmt.Errorf("cannot retry: results unavailable from etcd and Results API: %w", err)
-            }
-        }
+        // Priority 3: Query Tekton Results API
+        // DEFERRED TO PHASE 2
+        // Architectural decision pending: controller-side vs. client-side integration
+        // For v1, if Tier 1 & 2 fail, return clear error (see below)
         
         // Store harvested results
         if len(taskResults) > 0 {
@@ -370,9 +365,10 @@ func extractResultsForBypassedTasks(originalPR *PipelineRun, bypassedTasks []str
 **Harvesting priority rationale:**
 1. **Tier 1 first:** Bubbled-up results in `PipelineRun.Status.Results[]` survive TaskRun pruning (TTL: ~7 days vs. ~24 hours)
 2. **Tier 2 second:** Direct TaskRun results (only available if TaskRun not yet pruned)
-3. **Tier 3 last:** External Results API (Phase 2 feature, requires Results installation)
 
-**Error handling:** If all tiers fail, reject retry request immediately with actionable error message (fail-fast UX).
+**Phase 2 (deferred):** Tier 3 (Results API integration) — architectural approach TBD in separate design document.
+
+**Error handling (v1):** If both tiers fail, reject retry request immediately with actionable error message (fail-fast UX).
 
 ---
 
@@ -418,21 +414,14 @@ func ResolveResultRef(pr *PipelineRun, state PipelineRunState, ref *ResultRef) (
         }
     }
     
-    // Tier 3: Tekton Results API (Phase 2, optional)
-    // Fallback for pruned TaskRuns not memoized in spec
-    if isResultsEnabled() && pr.Annotations["tekton.dev/retryOf"] != "" {
-        originalPRUID := pr.Annotations["tekton.dev/retryOf"]
-        if value, err := queryResultsAPI(originalPRUID, taskName, resultName); err == nil {
-            // Archived result from Results API
-            return value, nil
-        }
-    }
+    // Tier 3: Tekton Results API
+    // DEFERRED TO PHASE 2 - v1 does not query external Results API
     
     // All tiers failed - result not found
     return "", &ResultNotFoundError{
         PipelineTask: taskName,
         ResultName:   resultName,
-        Reason:       "result not found in live state, memoized state, or Results API",
+        Reason:       "result not found in live state or memoized state",
     }
 }
 ```
@@ -440,8 +429,9 @@ func ResolveResultRef(pr *PipelineRun, state PipelineRunState, ref *ResultRef) (
 **Key design principles:**
 - **Tier 1 always wins:** Prevents stale memoized data from overriding fresh execution
 - **Tier 2 for bypassed tasks:** Provides results for tasks not re-run in this retry
-- **Tier 3 for recovery:** Phase 2 feature to handle pruned TaskRuns after extended delays
 - **Fail explicitly:** Clear error if result unavailable (triggers `ValidationFailed` task status)
+
+**Phase 2 (deferred):** Tier 3 (Results API) integration for recovery of pruned TaskRuns — architectural approach TBD.
 
 **Reconciler integration:**
 - No changes to reconciler reconcile loop
@@ -950,7 +940,7 @@ If required workspace data is lost (PVC missing), the retry algorithm automatica
 #### Recommendation for v1: Hybrid Option A + Option B
 
 1. **Enforce Option A & B for v1:** Combine pre-flight checks with mode validation. The controller/CLI validates that all required PVCs exist and are `Bound`. If a PVC was deleted due to `AffinityAssistantPerPipelineRun` or garbage collection, reject the retry immediately with a clear error message explaining how to configure workspaces for retries.
-2. **Defer Option C to Phase 2:** Explore a configurable TTL window (`retentionWindow`) in a future release if user telemetry shows `PerPipelineRun` cleanup is a major blocker for retry adoption.
+2. **Defer Option C to Phase 2:** Configurable PVC retention window will be evaluated if user feedback indicates a need.
 3. **Reject Option D:** Statically inferring workspace dependencies is too fragile for core Tekton reconciler logic.
 
 ---
@@ -1237,7 +1227,7 @@ spec:
 2. **Manual verification** → Security teams can compare stored SHAs against Git history for manual audits
 3. **Documentation** → Provides traceability for compliance without external dependencies
 
-**v2 enhancement (Chains integration):** See Part 9.8 for full Chains integration plan.
+**v2 enhancement (Chains integration):** Details in `design/phase2-enhancements.md`.
 
 **Benefit:** Retry execution immune to remote availability, provenance preserved for audit (v1) and future SLSA attestation (v2).
 
@@ -1326,7 +1316,6 @@ Cannot retry: Pipeline definition changed since original run.
 3. **Operational resilience:** Works even if Git repo made private, OCI registry down, credentials expired
 4. **Debugging clarity:** Engineers can inspect inline spec to see exactly what code ran
 
-**Implementation:**
 
 **Implementation:**
 
@@ -1340,13 +1329,11 @@ Cannot retry: Pipeline definition changed since original run.
 
 **Step 2: Provenance tools** (v1: audit/debugging, v2: Chains integration)
 - Annotations enable manual verification against Git history
-- Future Chains integration reads annotations for SLSA attestation (see Part 9.8)
-
-**Result:** Retry execution stable, provenance metadata preserved, no remote dependencies.
+- Future Chains integration reads annotations for SLSA attestation (see `design/phase2-enhancements.md`)
 
 **Result:** Retry execution stable, provenance metadata preserved for audit/debugging, no remote dependencies.
 
-**Note:** Provenance annotations serve immediate audit and compliance needs in v1 (see Section 9.3.1). Tekton Chains integration is planned for v2 (see Section 9.8).
+**Note:** Provenance annotations serve immediate audit and compliance needs in v1 (see Section 9.3.1). Tekton Chains integration is planned for v2 (see `design/phase2-enhancements.md`).
 
 ---
 
@@ -1466,29 +1453,9 @@ Uses existing `spec.pipelineSpec` field (inline Pipeline definition, already sup
 
 ---
 
-### 9.7 Future Work: v2+ Enhancements
+### 9.7 Future Enhancements
 
-**Tekton Chains Integration (Phase 2)**
-
-The provenance annotations added in v1 prepare the groundwork for Tekton Chains integration. Chains can use these annotations to generate SLSA provenance attestations that distinguish retry executions.
-
-**How Chains would use retry annotations (v2):**
-- Detect retry via `tekton.dev/retryOf` annotation
-- Read provenance (Git SHA, URL) from annotations
-- Generate SLSA attestation linking to immutable source
-- Distinguish inherited vs. fresh execution
-
-**v2 implementation tasks:**
-- Update Chains to read retry annotations for SLSA attestation
-- Generate attestations distinguishing inherited vs. fresh execution (see Part 11.3)
-- Document retry provenance contract for supply chain security
-
-**Why defer to v2:** 
-- Chains integration requires coordination with tektoncd/chains repository
-- Retry functionality provides immediate value without Chains (audit, debugging, compliance)
-- Provenance annotations in v1 are "Chains-ready" — no breaking changes needed for v2
-- Similar pattern to Tekton Results integration (Phase 1 = independent, Phase 2 = optional integration)
-
+**Phase 2:** Tekton Chains integration will leverage the provenance annotations added in v1. Details in `design/phase2-enhancements.md`.
 
 ---
 
@@ -1556,109 +1523,17 @@ validateRetryAvailability(originalPR) error {
 
 **Recommended:** **Option A** - pre-flight validation with clear error messages.
 
-### 10.3 Phase 2: Tekton Results Integration Strategy
+### 10.3 Recommended Approach for v1
 
-**Option A: Mandatory Tekton Results for Retry**
-
-Partial retry only works if Tekton Results is installed and configured.
+**v1 scope:** Two-tier lookup only (PipelineRun.Status → TaskRun.Status)
 
 **Implementation:**
-- Controller checks Results availability at startup
-- Retry endpoint returns 501 Not Implemented if Results not configured
-- All result extraction goes through Results API
-
-**Pros:**
-- Simple mental model (retry = requires Results)
-- No ambiguity about data source
-- Can enforce retention policies centrally
-
-**Cons:**
-- Cannot use retry without Results (blocks adoption)
-- Tight coupling between core Pipelines and Results
-- Results becomes a required dependency (was optional)
-
----
-
-**Option B: Optional Tekton Results as Fallback**
-
-Results is used opportunistically if available, but not required.
-
-**Implementation:**
-- Three-tier lookup: TaskRun.Status → PipelineRun.Status → Results API (if available)
-- If Results not installed, retry fails gracefully with clear error
-- Feature flag: `tekton.dev/results-enabled`
-
-**Pros:**
-- Loose coupling (Results remains optional)
-- Works in environments without Results
-- Gradual adoption path
-
-**Cons:**
-- Complex fallback logic
-- Inconsistent behavior (works sometimes, not others)
-- Users confused about when retry works
-
----
-
-**Option C: Hybrid with Pre-flight Validation**
-
-Validate data availability before retry, fail with clear guidance.
-
-**Implementation:**
-- At retry-request time, check:
-  1. Are required TaskRuns still in etcd?
-  2. Are results bubbled up to PipelineRun.Status?
-  3. If not, is Results installed?
-- Reject retry early if data unavailable
-- Error message guides user to solution (bubble up results or install Results)
-
-**Pros:**
-- Clear user feedback (fail fast)
-- Transparent about data requirements
-- Users understand why retry failed
-
-**Cons:**
-- Validation adds overhead
-- Multiple code paths to maintain
-
-### 10.3.1 Evaluation Matrix: Phase 2 Options
-
-| Criterion | Option A (Mandatory) | Option B (Optional Fallback) | Option C (Hybrid Validation) | Winner |
-|-----------|---------------------|------------------------------|------------------------------|--------|
-| **Ease of Adoption** | ✗ Blocks retry without Results | ✓ Works in K8s-only environments | ✓ Clear guidance, graceful degradation | **C** |
-| **Implementation Complexity** | ✓ Simple (single code path) | ✗ Complex (three-tier lookup) | Medium (validation logic) | **A** |
-| **User Clarity** | ✓ Clear requirement (Results or no retry) | ✗ Confusing (works sometimes, not others) | ✓ Fail-fast with actionable errors | **C** |
-| **Results Coupling** | ✗ Tight (Results becomes required) | ✓ Loose (Results remains optional) | ✓ Loose (Results optional but recommended) | **B** |
-| **Long-term Retry Window** | ✓ Weeks to months | Depends on bubbling strategy | Depends on bubbling strategy | **A** |
-| **Consistency** | ✓ Predictable behavior | ✗ Behavior varies by environment | ✓ Predictable (validated before retry) | **A** |
-
-**Score: Option C wins 3/6 criteria, balancing adoption, clarity, and loose coupling**
-
-### 10.3.2 Recommended Approach: Option C (Hybrid Validation)
-
-**For v1: Pre-flight validation with optional Results fallback (Option C)**
-
-#### Rationale
-
-1. **Fail-fast with clear guidance:** Users know immediately if their retry will work, with actionable error messages pointing them to solutions (bubble up results or install Results).
-
-2. **Doesn't block adoption:** Works in K8s-only environments for short retry windows (hours), while enabling longer windows (weeks) for Results-enabled clusters.
-
-3. **Loose coupling:** Results remains an optional companion project, not a hard dependency.
-
-4. **Transparent behavior:** Validation logic makes it obvious why a retry succeeded or failed (no hidden "works sometimes" magic).
-
-#### Implementation Path
-
-**Phase 1 (v1.0):** 
-- Pre-flight validation (check TaskRun availability, result bubbling)
+- Pre-flight validation: Check TaskRun availability and result bubbling before retry
 - Reject with clear error if data unavailable
-- No Results integration yet
+- Error messages guide users to bubble up results to Pipeline level
 
-**Phase 2 (v1.1+):**
-- Add Results API query as tertiary lookup tier
-- Feature flag: `tekton.dev/enable-results-fallback`
-- Document bubbling strategy in official retry guide
+**Phase 2:** Tekton Results API integration will be evaluated in a separate design document, including the architectural decision of controller-side vs. client-side implementation.
+
 
 ### 10.4 Error Message Design
 
@@ -1667,19 +1542,22 @@ Validate data availability before retry, fail with clear guidance.
 | Scenario | Error Message |
 |----------|---------------|
 | **PipelineRun pruned** | `Cannot perform partial retry: Original PipelineRun 'pr-123' no longer exists in cluster. Full re-run required.` |
-| **TaskRun pruned, result not bubbled** | `Cannot perform partial retry: Result 'clone.commit-sha' unavailable. TaskRun was pruned and result not bubbled up.\n\nTo enable retry after GC:\n  1. Bubble up results to Pipeline level (declare Pipeline.spec.results), OR\n  2. Install Tekton Results (Phase 2 feature)` |
+| **TaskRun pruned, result not bubbled** | `Cannot perform partial retry: Result 'clone.commit-sha' unavailable. TaskRun was pruned and result not bubbled up.\n\nTo enable retry after GC:\n  1. Bubble up results to Pipeline level (declare Pipeline.spec.results), OR\n  2. Wait for Phase 2 (Results API integration)` |
 | **TaskRun manually deleted** | `Cannot perform partial retry: TaskRun 'pr-123-clone' was deleted. Result data lost.\n\nPartial retry after manual TaskRun deletion is not supported. Full re-run required.` |
-| **Results unavailable (Phase 2)** | `Cannot perform partial retry: Tekton Results API unavailable or record expired.\n\nFull re-run required.` |
 
 ---
-### 10.5 Three-Tier Lookup Implementation (Phase 2)
+### 10.5 Phase 2: Results API Integration (Deferred)
 
-**Implementation details:** See Part 6.4 for the complete `ResolveResultRef()` three-tier lookup implementation (live state → memoized → Results API).
+**v1 scope:** Two-tier lookup only (live TaskRun.Status → PipelineRun.Status bubbled-up results). See Part 6.4 for implementation details.
 
-**Key points for Phase 2:**
-- Tier 3 (Results API) query adds 50-200ms latency per result
-- Controller should cache Results API responses per reconcile loop
-- Feature flag: `tekton.dev/enable-results-fallback=true` (default: false for v1)
+**Phase 2 scope (deferred to separate design):**
+- Tier 3: Query Tekton Results API for archived TaskRun records
+- **Architectural decision pending:** Controller-side vs. client-side Results API integration
+  - **Controller-side:** PipelineRun reconciler queries Results API during `ResolveResultRef()`
+  - **Client-side:** `tkn` CLI / Dashboard queries Results API during retry request preparation
+- Trade-offs to evaluate: dependency coupling, reconcile latency, testing complexity, feature flag requirements
+
+**Rationale for deferral:** Results API integration requires careful architectural consideration to avoid tight coupling between core Pipelines controller and optional Results component. This decision will be revisited when Phase 2 is actively scoped.
 
 ---
 
@@ -1707,27 +1585,6 @@ spec:
 **Effect:** When TaskRun `clone` is pruned, `commit-sha` persists in `PipelineRun.Status.Results[]` for the life of the PipelineRun (typically 7 days vs. 24 hours for TaskRuns).
 
 **Documentation note:** Retry guide should include a "Best Practices" section recommending bubbling for all results referenced by downstream tasks.
-
----
-
-### 10.7 Results API Query Implementation (Phase 2)
-
-**Query flow:**
-1. Construct Results API client (gRPC)
-2. Query record: `default/results/{originalPRUID}/records/{originalPRUID}-{taskName}`
-3. Unmarshal TaskRun from protobuf
-4. Extract result by name
-
-**Key considerations:**
-- **Authentication:** Requires gRPC client credentials
-- **Latency:** 50-200ms per result lookup
-- **Caching:** Cache responses per reconcile loop
-- **Feature flag:** `tekton.dev/enable-results-fallback=true`
-
-**Error handling:** Return clear errors if Results API unavailable or result not found in archived TaskRun.
-
----
-
 
 ---
 
@@ -1805,7 +1662,7 @@ spec:
 - Rejected due to: Repeated calculations, version skew risk, consistency concerns
 - Note: Would require admission webhook validation for security (detailed in Section 11.2)
 
-**Option C: Declarative Annotation** - Deferred to v2. See Section 11.6 for future consideration.
+**Option C: Declarative Annotation** - Deferred to v2. See `design/phase2-enhancements.md` for future consideration.
 - Summary: `tekton.dev/auto-retry` annotation triggers automatic retry
 - Deferred due to: Lack of user confirmation flow for side effects
 - Future use case: Fully automated CI/CD pipelines
@@ -1882,6 +1739,7 @@ User A: Creates retry of 'pr-secret' → gets results via Spec.retriedTaskResult
    if annotations["tekton.dev/retryOf"] exists:
      - Original PipelineRun must exist
      - Original PipelineRun must be in terminal state
+     - Original PR must be in same namespace (reject cross-namespace retries)
      - Caller must have GET permission on original PR
    ```
 
@@ -1898,13 +1756,6 @@ User A: Creates retry of 'pr-secret' → gets results via Spec.retriedTaskResult
    if workspace PVC referenced:
      - Verify PVC exists and is Bound
      - Warn if PVC is not the original's PVC (staleness risk)
-   ```
-
-4. **Namespace isolation:**
-   ```yaml
-   if annotations["tekton.dev/retryOf"] exists:
-     - Original PR must be in same namespace
-     - Reject cross-namespace retries
    ```
 
 **Rejection example:**
@@ -1928,66 +1779,28 @@ User A: Creates retry of 'pr-secret' → gets results via Spec.retriedTaskResult
 
 **Core requirement:** Provenance must distinguish **inherited** work from **newly executed** work.
 
-#### Provenance Contract for Chains
+**v1 implementation:** The `status.retryMetadata` field enables audit tools to distinguish inherited work from newly executed work.
 
-**For bypassed (reused) tasks:**
-```json
-{
-  "taskName": "clone",
-  "status": "succeeded",
-  "inheritedFrom": {
-    "pipelineRun": "pr-123",
-    "pipelineRunUID": "abc-def-123",
-    "taskRun": "pr-123-clone",
-    "taskRunUID": "xyz-789",
-    "originalCompletionTime": "2026-09-01T10:30:00Z"
-  },
-  "executedInRetry": false,  // Not executed in this run
-  "results": {
-    "commit-sha": "abc123"  // Mark as inherited
-  }
-}
-```
-
-**For re-run tasks:**
-```json
-{
-  "taskName": "test",
-  "status": "succeeded",
-  "executedInRetry": true,    // Executed fresh in this run
-  "retryOf": {
-    "pipelineRun": "pr-123",
-    "previousStatus": "failed"
-  },
-  "results": {
-    "test-report": "junit.xml"  // Fresh result
-  }
-}
-```
-
-#### Status Field Design
-
-**To enable Chains to detect retry context:**
-
+**Status field structure:**
 ```yaml
 status:
-  # Existing fields
-  conditions: [...]
-  childReferences: [...]
-  
-  # New field for retry metadata
   retryMetadata:
     retryOf: "pr-123-uid"
     retryAttempt: 1
-    preservedTasks: ["clone", "build"]  # Inherited from original
-    rerunTasks: ["test", "scan", "deploy"]  # Fresh execution
+    preservedTasks: ["clone", "build"]
+    rerunTasks: ["test", "scan", "deploy"]
 ```
 
-This allows provenance producers to:
-1. Detect this is a retry run
-2. Identify which tasks were inherited vs. fresh
-3. Link provenance back to original run
+**Use cases:**
+- Audit logs trace which tasks were reused vs. re-executed
+- Debugging tools visualize retry lineage
+- Manual compliance verification
 
+**Phase 2:** Tekton Chains SLSA provenance attestations. Details in `design/phase2-enhancements.md`.
+
+---
+
+### 11.4
 ---
 
 ### 11.4 Recommended API Design (Final)
@@ -2018,13 +1831,7 @@ This allows provenance producers to:
 - **Option B** (client-side): See Part 7.3 and 7.5 for evaluation
 - **Option C** (annotation): Deferred to v2 for automation use cases
 
-**For v2+ consideration:**
-- **Option C** (annotation-based auto-retry) for fully automated CI/CD scenarios
-  - Requires: retry loop protection, side effect detection, safety policies
-  - Use case: Automatically retry failed pipelines without human intervention
-- Retry policies at Pipeline level (max attempts, backoff strategy)
-- Enhanced provenance with full task lineage graph
-- Cross-namespace retries (if strong use case emerges with proper security model)
+**For v2+ consideration:** Additional features detailed in `design/phase2-enhancements.md`.
 
 ---
 
